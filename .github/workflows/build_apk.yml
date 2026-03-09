@@ -1,0 +1,128 @@
+name: Build Android APK
+
+on:
+  # Déclenché à chaque push sur main
+  push:
+    branches: [ main ]
+  # Déclenché à chaque Pull Request vers main
+  pull_request:
+    branches: [ main ]
+  # Déclenchement manuel depuis l'onglet Actions de GitHub
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build APK (arm64 + armv7)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+
+      # ── 1. Récupérer le code ───────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python 3.11 ────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ── 3. Cache du dossier .buildozer ────────────────────────────────
+      #   Le premier build prend ~30 min (téléchargements SDK/NDK/recettes).
+      #   Les builds suivants réutilisent ce cache et prennent ~5-10 min.
+      - name: Cache buildozer global directory
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.buildozer
+            .buildozer
+          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            buildozer-${{ runner.os }}-
+
+      # ── 4. Dépendances système ─────────────────────────────────────────
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            python3-pip python3-venv git zip unzip \
+            openjdk-17-jdk \
+            autoconf libtool pkg-config \
+            zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 \
+            cmake libffi-dev libssl-dev \
+            libltdl-dev \
+            build-essential
+
+      # ── 5. Buildozer + Cython ─────────────────────────────────────────
+      - name: Install buildozer and Cython
+        run: |
+          pip install --upgrade pip
+          pip install buildozer cython
+
+      # ── 6. Build debug APK ────────────────────────────────────────────
+      - name: Build APK (debug)
+        run: |
+          buildozer -v android debug 2>&1 | tee build.log
+
+      # ── 7. Vérifier que l'APK existe ──────────────────────────────────
+      - name: Check APK output
+        run: |
+          ls -lh bin/*.apk
+          echo "APK_PATH=$(ls bin/*.apk | head -1)" >> $GITHUB_ENV
+
+      # ── 8. Upload de l'APK comme artefact GitHub ──────────────────────
+      #   Téléchargeable depuis l'onglet Actions → run → Artifacts
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fakescan-debug-apk
+          path: bin/*.apk
+          retention-days: 30          # conservé 30 jours
+
+      # ── 9. Upload du log de build (toujours, même en cas d'échec) ─────
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 7
+
+  # ────────────────────────────────────────────────────────────────────────
+  # JOB RELEASE : créé une GitHub Release avec l'APK à chaque tag vX.Y.Z
+  # ────────────────────────────────────────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-22.04
+    # Ne se déclenche que si le trigger est un tag de version (ex: v1.0.0)
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: write     # nécessaire pour créer une release
+
+    steps:
+      - name: Download APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: fakescan-debug-apk
+          path: bin/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: bin/*.apk
+          name: "Fake Scan PDF ${{ github.ref_name }}"
+          body: |
+            ## Fake Scan PDF ${{ github.ref_name }}
+
+            ### Installation
+            1. Télécharger le fichier `.apk` ci-dessous
+            2. Sur Android : Paramètres → Sécurité → Autoriser sources inconnues
+            3. Ouvrir le fichier `.apk` pour installer
+
+            ### Changements
+            _Voir les commits depuis la version précédente._
+          draft: false
+          prerelease: false
