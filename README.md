@@ -1,6 +1,6 @@
 # Fake Scan PDF — Android
 
-[![Build Android APK](https://github.com/TON_USERNAME/fakescan-android/actions/workflows/build_apk.yml/badge.svg)](https://github.com/TON_USERNAME/fakescan-android/actions/workflows/build_apk.yml)
+[![Build Android APK](https://github.com/tiliarou/fakescan-android/actions/workflows/build_apk.yml/badge.svg)](https://github.com/tiliarou/fakescan-android/actions/workflows/build_apk.yml)
 
 Application Android (Kivy + PyMuPDF) qui simule un document imprimé, signé puis scanné.
 
