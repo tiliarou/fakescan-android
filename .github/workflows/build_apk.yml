@@ -30,6 +30,7 @@ jobs:
           docker run --rm \
             --entrypoint /bin/sh \
             -v ${{ github.workspace }}:/home/user/hostcwd \
+            -e HOME=/home/user/hostcwd \
             ghcr.io/kivy/buildozer:latest \
             -c "git config --global --add safe.directory '*' && yes | /home/user/.venv/bin/python -m buildozer android debug"
             
