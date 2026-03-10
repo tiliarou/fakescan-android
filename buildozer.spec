@@ -15,7 +15,7 @@ entrypoint      = main.py
 
 # ── Dépendances Python ──────────────────────────────────────────────────────
 # pymupdf remplace pdf2image (pas besoin de Poppler natif)
-requirements    = python3,kivy==2.3.0,pillow,pymupdf,numpy,plyer
+requirements    = python3,kivy==2.3.0,pillow,pymupdf,plyer
 
 # ── Android ────────────────────────────────────────────────────────────────
 android.permissions = READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,\
