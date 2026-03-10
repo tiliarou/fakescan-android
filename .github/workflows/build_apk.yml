@@ -25,6 +25,13 @@ jobs:
           key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
           restore-keys: buildozer-${{ runner.os }}-
 
+      - name: Fix python-for-android git remote (cache repair)
+        run: |
+              P4A="${{ github.workspace }}/.buildozer/android/platform/python-for-android"
+              if [ -d "$P4A" ] && ! git -C "$P4A" remote get-url origin &>/dev/null; then
+                git -C "$P4A" remote add origin https://github.com/kivy/python-for-android.git
+              fi
+      
       - name: Build APK via kivy/buildozer Docker image
         run: |
           docker run --rm \
