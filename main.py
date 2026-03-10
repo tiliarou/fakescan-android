@@ -43,13 +43,27 @@ from kivy.uix.slider import Slider
 from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
 
-from PIL import Image, ImageFilter, ImageEnhance, ImageOps
+from PIL import Image, ImageFilter, ImageEnhance, ImageOps, ImageChops
+import os
 
-try:
-    import numpy as np
-    HAS_NUMPY = True
-except ImportError:
-    HAS_NUMPY = False
+def _pil_grain_L(img, strength=4):
+    """Bruit grain sur image en niveaux de gris (mode L) — PIL pur, sans numpy."""
+    w, h = img.size
+    noise = Image.frombytes('L', (w, h), os.urandom(w * h))
+    noise = noise.point(lambda x: int(x / 255 * (2 * strength)) - strength + 128)
+    return ImageChops.add(img, noise, scale=1, offset=-128)
+
+def _pil_grain_RGBA(img, strength=8):
+    """Bruit grain sur image RGBA uniquement là où alpha > 30 — PIL pur, sans numpy."""
+    w, h = img.size
+    r, g, b, a = img.split()
+    noise = Image.frombytes('L', (w, h), os.urandom(w * h))
+    noise = noise.point(lambda x: int(x / 255 * (2 * strength)) - strength + 128)
+    mask  = a.point(lambda x: 255 if x > 30 else 0)
+    def _apply(ch):
+        noisy = ImageChops.add(ch, noise, scale=1, offset=-128)
+        return Image.composite(noisy, ch, mask)
+    return Image.merge('RGBA', (_apply(r), _apply(g), _apply(b), a))
 
 try:
     import fitz  # PyMuPDF
@@ -152,15 +166,7 @@ def vary_signature(base_img):
     sig = base_img.copy()
     sig = sig.rotate(random.uniform(-1.2, 1.2), expand=True, fillcolor=(0, 0, 0, 0))
     sig = ImageEnhance.Contrast(sig).enhance(random.uniform(0.88, 1.12))
-    if HAS_NUMPY:
-        arr  = np.array(sig)
-        mask = arr[:, :, 3] > 30
-        ns   = random.randint(4, 10)
-        noise = np.random.randint(-ns, ns + 1, arr[:, :, :3].shape, dtype=np.int16)
-        rgb   = arr[:, :, :3].astype(np.int16)
-        rgb[mask] = np.clip(rgb[mask] + noise[mask], 0, 255)
-        arr[:, :, :3] = rgb.astype(np.uint8)
-        sig = Image.fromarray(arr, "RGBA")
+    sig = _pil_grain_RGBA(sig, strength=random.randint(4, 10))
     sig = sig.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.05, 0.55)))
     return sig
 
@@ -183,10 +189,7 @@ def simulate_scan(img, tilt=1.2, blur=0.3, contrast=1.1, brightness=1.0):
     img = ImageOps.grayscale(img)
     if blur > 0:
         img = img.filter(ImageFilter.GaussianBlur(radius=blur))
-    if HAS_NUMPY:
-        arr = np.array(img).astype(np.int16)
-        arr = np.clip(arr + np.random.randint(-4, 5, arr.shape, dtype=np.int16), 0, 255).astype(np.uint8)
-        img = Image.fromarray(arr, "L")
+    img = _pil_grain_L(img, strength=4)
     img = ImageEnhance.Contrast(img).enhance(contrast    + random.uniform(-0.05,  0.05))
     img = ImageEnhance.Brightness(img).enhance(brightness + random.uniform(-0.02,  0.02))
     w, h = img.size
