@@ -27,10 +27,10 @@ jobs:
       - name: Build APK via kivy/buildozer Docker image
         run: |
           docker run --rm \
+            --entrypoint /bin/sh \
             -v ${{ github.workspace }}:/home/user/hostcwd \
-            -e ANDROID_SDK_MANAGER_OPTS="--sdk_root=/home/user/.buildozer/android/platform/android-sdk" \
             ghcr.io/kivy/buildozer:latest \
-            sh -c "yes | sdkmanager --licenses > /dev/null 2>&1 || true; buildozer android debug"
+            -c "yes | /home/user/.venv/bin/python -m buildozer android debug"
 
       - name: Find APK
         run: |
@@ -68,8 +68,5 @@ jobs:
           name: Fake Scan PDF ${{ github.ref_name }}
           body: |
             ## Fake Scan PDF ${{ github.ref_name }}
-            1. Telecharger le .apk ci-dessous
-            2. Android > Parametres > Securite > Sources inconnues
-            3. Ouvrir le .apk pour installer
           draft: false
           prerelease: false
