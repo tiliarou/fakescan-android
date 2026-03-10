@@ -28,8 +28,9 @@ jobs:
         run: |
           docker run --rm \
             -v ${{ github.workspace }}:/home/user/hostcwd \
+            -e ANDROID_SDK_MANAGER_OPTS="--sdk_root=/home/user/.buildozer/android/platform/android-sdk" \
             ghcr.io/kivy/buildozer:latest \
-            android debug
+            sh -c "yes | sdkmanager --licenses > /dev/null 2>&1 || true; buildozer android debug"
 
       - name: Find APK
         run: |
