@@ -14,8 +14,7 @@ source.include_exts = py,png,jpg,jpeg,kv,atlas
 entrypoint      = main.py
 
 # ── Dépendances Python ──────────────────────────────────────────────────────
-# pymupdf remplace pdf2image (pas besoin de Poppler natif)
-requirements    = python3,kivy==2.3.0,pillow,pymupdf,plyer
+requirements    = python3,kivy==2.3.0,pillow,plyer
 
 # ── Android ────────────────────────────────────────────────────────────────
 android.permissions = READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,\
