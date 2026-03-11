@@ -217,12 +217,23 @@ def fit_into_rect(img, rect, jitter=True):
     return img_r, cx, cy
 
 
-def simulate_scan(img, tilt=1.2, blur=0.3, contrast=1.1, brightness=1.0):
+def simulate_scan(img, tilt=1.2, blur=0.3, contrast=1.1, brightness=1.0, grayscale=True):
     img = img.rotate(random.uniform(-tilt, tilt), expand=True, fillcolor=(255, 255, 255))
-    img = ImageOps.grayscale(img)
-    if blur > 0:
-        img = img.filter(ImageFilter.GaussianBlur(radius=blur))
-    img = _pil_grain_L(img, strength=4)
+    if grayscale:
+        img = ImageOps.grayscale(img)
+        if blur > 0:
+            img = img.filter(ImageFilter.GaussianBlur(radius=blur))
+        img = _pil_grain_L(img, strength=4)
+    else:
+        if blur > 0:
+            img = img.filter(ImageFilter.GaussianBlur(radius=blur))
+        # Grain couleur : appliqué sur chaque canal RGB
+        img = img.convert("RGB")
+        r, g, b = img.split()
+        r = _pil_grain_L(r, strength=3)
+        g = _pil_grain_L(g, strength=3)
+        b = _pil_grain_L(b, strength=3)
+        img = Image.merge("RGB", (r, g, b))
     img = ImageEnhance.Contrast(img).enhance(contrast + random.uniform(-0.05, 0.05))
     img = ImageEnhance.Brightness(img).enhance(brightness + random.uniform(-0.02, 0.02))
     w, h = img.size
@@ -588,11 +599,18 @@ if ANDROID:
                 # Essayer d'obtenir le chemin via cursor
                 cursor = resolver.query(uri, None, None, None, None)
                 path   = None
+                real_name = None
                 if cursor and cursor.moveToFirst():
                     try:
-                        idx  = cursor.getColumnIndex("_data")
+                        idx = cursor.getColumnIndex("_data")
                         if idx >= 0:
                             path = cursor.getString(idx)
+                    except Exception:
+                        pass
+                    try:
+                        idx2 = cursor.getColumnIndex("_display_name")
+                        if idx2 >= 0:
+                            real_name = cursor.getString(idx2)
                     except Exception:
                         pass
                     cursor.close()
@@ -603,7 +621,7 @@ if ANDROID:
                     istream = resolver.openInputStream(uri)
                     suffix  = ".pdf"
                     try:
-                        name = uri.getLastPathSegment()
+                        name = real_name or uri.getLastPathSegment()
                         if name and "." in name:
                             suffix = "." + name.rsplit(".", 1)[-1]
                     except Exception:
@@ -618,8 +636,13 @@ if ANDROID:
                     tmp.close()
                     istream.close()
                     path = tmp.name
+                    if real_name:
+                        App.get_running_app().pdf_display_name = real_name
 
                 if path:
+                    # Stocker le vrai nom pour le fichier de sortie
+                    if real_name:
+                        App.get_running_app().pdf_display_name = real_name
                     Clock.schedule_once(lambda dt: cb(path))
             except Exception as exc:
                 import traceback
@@ -804,6 +827,33 @@ class MainScreen(Screen):
 
         content.add_widget(section_label("Effets scan"))
 
+        # Toggle Noir & Blanc / Couleurs
+        from kivy.uix.togglebutton import ToggleButton
+        toggle_row = BoxLayout(size_hint_y=None, height=H_BTN, spacing=dp(6))
+        self.btn_nb  = ToggleButton(
+            text="Noir & Blanc", group="colormode", state="down",
+            background_normal="", background_down="",
+            background_color=C_HEADER, color=C_WHITE,
+            font_size=FS_BTN, size_hint=(0.5, None), height=H_BTN,
+        )
+        self.btn_col = ToggleButton(
+            text="Couleurs", group="colormode", state="normal",
+            background_normal="", background_down="",
+            background_color=C_GREY_BTN, color=C_TEXT_DARK,
+            font_size=FS_BTN, size_hint=(0.5, None), height=H_BTN,
+        )
+        def _on_toggle(btn, *_):
+            if btn.state == "down":
+                self.btn_nb.background_color  = C_HEADER if self.btn_nb.state  == "down" else C_GREY_BTN
+                self.btn_col.background_color = C_HEADER if self.btn_col.state == "down" else C_GREY_BTN
+                self.btn_nb.color  = C_WHITE     if self.btn_nb.state  == "down" else C_TEXT_DARK
+                self.btn_col.color = C_WHITE     if self.btn_col.state == "down" else C_TEXT_DARK
+        self.btn_nb.bind(state=_on_toggle)
+        self.btn_col.bind(state=_on_toggle)
+        toggle_row.add_widget(self.btn_nb)
+        toggle_row.add_widget(self.btn_col)
+        content.add_widget(toggle_row)
+
         self.sl_tilt       = NamedSlider("Tilt (deg)",  0.0, 3.0, 1.2, 0.1)
         self.sl_blur       = NamedSlider("Flou",        0.0, 2.0, 0.3, 0.05)
         self.sl_contrast   = NamedSlider("Contraste",   0.7, 1.6, 1.1, 0.05)
@@ -833,7 +883,11 @@ class MainScreen(Screen):
         app.pdf_path    = path
         app.parafe_rect = None
         app.sig_rect    = None
-        self.pdf_label.text  = os.path.basename(path)
+        # Récupérer le vrai nom depuis l'URI si dispo, sinon basename du path
+        display_name = os.path.basename(path)
+        # Sur Android le path peut être un tmp genre tmpXXXX.pdf — on garde le nom affiché
+        app.pdf_display_name = display_name
+        self.pdf_label.text  = display_name
         self.pdf_label.color = (0.10, 0.14, 0.55, 1)
         self.btn_picker.disabled = False
         try:
@@ -899,6 +953,7 @@ class MainScreen(Screen):
 
         params = {
             "pdf_path":     app.pdf_path,
+            "pdf_name":     getattr(app, "pdf_display_name", os.path.basename(app.pdf_path)),
             "parafe_path":  app.parafe_path,
             "sig_path":     app.sig_path,
             "parafe_rect":  app.parafe_rect,
@@ -909,6 +964,7 @@ class MainScreen(Screen):
             "blur":         self.sl_blur.value,
             "contrast":     self.sl_contrast.value,
             "brightness":   self.sl_brightness.value,
+            "grayscale":    self.btn_nb.state == "down",
         }
         threading.Thread(target=self._worker, args=(params,), daemon=True).start()
 
@@ -943,10 +999,11 @@ class MainScreen(Screen):
                     page_img,
                     tilt=p["tilt"], blur=p["blur"],
                     contrast=p["contrast"], brightness=p["brightness"],
+                    grayscale=p["grayscale"],
                 )
                 out_images.append(page_img.convert("RGB"))
 
-            base = os.path.splitext(os.path.basename(p["pdf_path"]))[0]
+            base = os.path.splitext(p["pdf_name"])[0]
 
             # Dossier de sortie garanti en écriture
             if ANDROID and HAS_JNIUS:
@@ -1069,7 +1126,8 @@ class MainScreen(Screen):
 class FakeScanApp(App):
 
     def build(self):
-        self.pdf_path    = None
+        self.pdf_path         = None
+        self.pdf_display_name = None
         self.parafe_path = None
         self.sig_path    = None
         self.total_pages = 999
