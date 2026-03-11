@@ -227,7 +227,7 @@ def simulate_scan(img, tilt=1.2, blur=0.3, contrast=1.1, brightness=1.0, graysca
     else:
         if blur > 0:
             img = img.filter(ImageFilter.GaussianBlur(radius=blur))
-        # Grain couleur : appliqué sur chaque canal RGB
+        # Grain couleur : applique sur chaque canal RGB
         img = img.convert("RGB")
         r, g, b = img.split()
         r = _pil_grain_L(r, strength=3)
@@ -481,12 +481,13 @@ class PickerCanvas(Widget):
         else:
             ry0_f, ry1_f = ry0, ry1
         rect = Rect(rx0, ry0_f, rx1, ry1_f)
+        # FIX: etait max(x0, y1) / max(y0, y1) -> typo corrigee en max(x0, x1) / max(y0, y1)
         if self.mode == "parafe":
             self.rect_parafe         = rect
-            self._rect_parafe_canvas = (min(x0, x1), min(y0, y1), max(x0, y1), max(y0, y1))
+            self._rect_parafe_canvas = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
         else:
             self.rect_sig            = rect
-            self._rect_sig_canvas    = (min(x0, x1), min(y0, y1), max(x0, y1), max(y0, y1))
+            self._rect_sig_canvas    = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
         self._redraw()
         return True
 
@@ -545,9 +546,9 @@ class PickerScreen(Screen):
     def _set_mode(self, mode):
         self.picker.mode = mode
         if mode == "parafe":
-            self.status_lbl.text = "Mode PARAFE actif — glisser pour delimiter"
+            self.status_lbl.text = "Mode PARAFE actif - glisser pour delimiter"
         else:
-            self.status_lbl.text = "Mode SIGNATURE actif — glisser pour delimiter"
+            self.status_lbl.text = "Mode SIGNATURE actif - glisser pour delimiter"
 
     def _clear(self):
         self.picker.clear_rects()
@@ -577,21 +578,25 @@ class PickerScreen(Screen):
 # SELECTEUR DE FICHIER NATIF ANDROID
 # -------------------------------------------------------------------------
 
-# Callback global pour recevoir le résultat de l'Intent
+# Callback global pour recevoir le resultat de l'Intent
 _file_picker_callback = None
+# FIX: stocker separement si la selection en cours est un PDF ou une image
+_file_picker_is_pdf = False
 
 if ANDROID:
     from android.activity import bind as activity_bind  # type: ignore
 
     def _on_activity_result(requestCode, resultCode, intent):
-        global _file_picker_callback
+        global _file_picker_callback, _file_picker_is_pdf
         RESULT_OK = -1
         if requestCode == 42 and resultCode == RESULT_OK and intent and _file_picker_callback:
             uri  = intent.getData()
             cb   = _file_picker_callback
+            is_pdf = _file_picker_is_pdf
             _file_picker_callback = None
+            _file_picker_is_pdf   = False
 
-            # Résoudre l'URI en chemin réel
+            # Resoudre l'URI en chemin reel
             try:
                 ContentResolver  = autoclass("android.content.ContentResolver")
                 PythonActivity   = autoclass("org.kivy.android.PythonActivity")
@@ -622,7 +627,7 @@ if ANDROID:
                 if not path:
                     import tempfile
                     istream = resolver.openInputStream(uri)
-                    suffix  = ".pdf"
+                    suffix  = ".pdf" if is_pdf else ".png"
                     try:
                         name = real_name or uri.getLastPathSegment()
                         if name and "." in name:
@@ -640,20 +645,21 @@ if ANDROID:
                     istream.close()
                     path = tmp.name
 
-                # Déterminer un nom "humain" pour le PDF
-                try:
-                    if real_name:
-                        display_name = real_name
-                    else:
-                        seg = uri.getLastPathSegment()
-                        if seg:
-                            display_name = seg
-                except Exception:
-                    pass
-                if not display_name and path:
-                    display_name = os.path.basename(path)
-                if display_name:
-                    App.get_running_app().pdf_display_name = display_name
+                # FIX: ne stocker pdf_display_name QUE si on selectionne un PDF
+                if is_pdf:
+                    try:
+                        if real_name:
+                            display_name = real_name
+                        else:
+                            seg = uri.getLastPathSegment()
+                            if seg:
+                                display_name = seg
+                    except Exception:
+                        pass
+                    if not display_name and path:
+                        display_name = os.path.basename(path)
+                    if display_name:
+                        App.get_running_app().pdf_display_name = display_name
 
                 if path:
                     Clock.schedule_once(lambda dt: cb(path))
@@ -665,10 +671,11 @@ if ANDROID:
 
 
 def open_file_picker(callback, mime_type="*/*"):
-    """Ouvre le sélecteur de fichier natif Android ou un FilePopup sur desktop."""
-    global _file_picker_callback
+    """Ouvre le selecteur de fichier natif Android ou un FilePopup sur desktop."""
+    global _file_picker_callback, _file_picker_is_pdf
     if ANDROID and HAS_JNIUS:
         _file_picker_callback = callback
+        _file_picker_is_pdf   = (mime_type == "application/pdf")
         Intent         = autoclass("android.content.Intent")
         PythonActivity = autoclass("org.kivy.android.PythonActivity")
         intent = Intent(Intent.ACTION_GET_CONTENT)
@@ -897,8 +904,8 @@ class MainScreen(Screen):
         app.pdf_path    = path
         app.parafe_rect = None
         app.sig_rect    = None
-        # Sur Android, pdf_display_name a déjà été renseigné par _on_activity_result
-        # avant l'appel de ce callback — ne pas l'écraser avec le nom du fichier tmp
+        # Sur Android, pdf_display_name a deja ete renseigne par _on_activity_result
+        # avant l'appel de ce callback - ne pas l'ecraser avec le nom du fichier tmp
         if not app.pdf_display_name:
             app.pdf_display_name = os.path.basename(path)
         self.pdf_label.text  = app.pdf_display_name
@@ -914,6 +921,7 @@ class MainScreen(Screen):
         open_file_picker(self._on_parafe_selected, mime_type="image/*")
 
     def _on_parafe_selected(self, path):
+        # FIX: ne pas toucher a pdf_display_name ici
         App.get_running_app().parafe_path = path
         self.parafe_label.text  = os.path.basename(path)
         self.parafe_label.color = (0.30, 0.05, 0.40, 1)
@@ -922,6 +930,7 @@ class MainScreen(Screen):
         open_file_picker(self._on_sig_selected, mime_type="image/*")
 
     def _on_sig_selected(self, path):
+        # FIX: ne pas toucher a pdf_display_name ici
         App.get_running_app().sig_path = path
         self.sig_label.text  = os.path.basename(path)
         self.sig_label.color = (0.05, 0.35, 0.05, 1)
@@ -967,7 +976,7 @@ class MainScreen(Screen):
 
         params = {
             "pdf_path":     app.pdf_path,
-            "pdf_name":     getattr(app, "pdf_display_name", os.path.basename(app.pdf_path)),
+            "pdf_name":     getattr(app, "pdf_display_name", None) or os.path.basename(app.pdf_path),
             "parafe_path":  app.parafe_path,
             "sig_path":     app.sig_path,
             "parafe_rect":  app.parafe_rect,
@@ -1022,8 +1031,8 @@ class MainScreen(Screen):
             Clock.schedule_once(lambda dt: self._prog("Encodage PDF..."))
 
             if ANDROID and HAS_JNIUS:
-                # Écrire directement dans MediaStore Downloads
-                # → retourne un content:// URI utilisable directement pour ouvrir
+                # Ecrire directement dans MediaStore Downloads
+                # -> retourne un content:// URI utilisable directement pour ouvrir
                 try:
                     ContentValues  = autoclass("android.content.ContentValues")
                     Downloads      = autoclass("android.provider.MediaStore$Downloads")
@@ -1036,7 +1045,7 @@ class MainScreen(Screen):
                     values.put("mime_type",     "application/pdf")
                     values.put("relative_path", "Download/")
 
-                    # Supprimer l'entrée existante si même nom
+                    # Supprimer l'entree existante si meme nom
                     try:
                         resolver.delete(
                             Downloads.EXTERNAL_CONTENT_URI,
@@ -1060,7 +1069,7 @@ class MainScreen(Screen):
                             self._on_done(n, u))
 
                 except Exception:
-                    # Fallback : écrire sur disque
+                    # Fallback : ecrire sur disque
                     import traceback; traceback.print_exc()
                     Environment = autoclass("android.os.Environment")
                     out_dir  = Environment.getExternalStoragePublicDirectory(
@@ -1103,6 +1112,7 @@ class MainScreen(Screen):
                 try:
                     Intent         = autoclass("android.content.Intent")
                     Uri            = autoclass("android.net.Uri")
+                    JavaString     = autoclass("java.lang.String")
                     PythonActivity = autoclass("org.kivy.android.PythonActivity")
                     ctx    = PythonActivity.mActivity
                     uri    = Uri.parse(content_uri_str)
@@ -1110,8 +1120,9 @@ class MainScreen(Screen):
                     intent.setDataAndType(uri, "application/pdf")
                     intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                     intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    # FIX: caster le titre en java.lang.String pour eviter l'erreur Pyjnius
                     ctx.startActivity(
-                        Intent.createChooser(intent, "Ouvrir avec"))
+                        Intent.createChooser(intent, JavaString("Ouvrir avec")))
                 except Exception as exc:
                     self._toast("Erreur : " + str(exc), duration=4)
             else:
