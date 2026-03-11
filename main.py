@@ -66,17 +66,15 @@ else:
 # -------------------------------------------------------------------------
 
 def ensure_white_bg(img):
-    """Si l'image a un canal alpha (RGBA/LA), composite sur fond blanc.
-    Evite le fond noir sur les PDF formulaires avec zones transparentes."""
+    """Si l'image a un canal alpha (RGBA/LA), composite sur fond blanc."""
     if img.mode in ("RGBA", "LA"):
         bg = Image.new("RGB", img.size, (255, 255, 255))
-        bg.paste(img, mask=img.split()[-1])  # split()[-1] = canal alpha
+        bg.paste(img, mask=img.split()[-1])
         return bg
     return img.convert("RGB")
 
 
 def _pil_grain_L(img, strength=4):
-    """Bruit grain sur image en niveaux de gris (mode L) - PIL pur, sans numpy."""
     w, h = img.size
     noise = Image.frombytes('L', (w, h), os.urandom(w * h))
     noise = noise.point(lambda x: int(x / 255 * (2 * strength)) - strength + 128)
@@ -84,7 +82,6 @@ def _pil_grain_L(img, strength=4):
 
 
 def _pil_grain_RGBA(img, strength=8):
-    """Bruit grain sur image RGBA - PIL pur, sans numpy."""
     w, h = img.size
     r, g, b, a = img.split()
     noise = Image.frombytes('L', (w, h), os.urandom(w * h))
@@ -109,26 +106,25 @@ C_GREY_BTN  = (0.88, 0.88, 0.88, 1)
 C_WHITE     = (1, 1, 1, 1)
 C_TEXT_DARK = (0.15, 0.15, 0.15, 1)
 
-
 from kivy.metrics import dp, sp as _sp
 
-# Polices (sp : respecte la preference utilisateur de taille de texte)
-FS_BTN     = "16sp"   # boutons
-FS_LABEL   = "15sp"   # labels courants
-FS_SECTION = "17sp"   # titres de section
-FS_INPUT   = "16sp"   # champs de saisie
-FS_HEADER  = "20sp"   # titre app
-FS_POPUP   = "15sp"   # toasts / popups
+FS_BTN     = "16sp"
+FS_LABEL   = "15sp"
+FS_SECTION = "17sp"
+FS_INPUT   = "16sp"
+FS_HEADER  = "20sp"
+FS_POPUP   = "15sp"
 
-# Hauteurs (dp : independant de la densite, equivalent aux dp Android natifs)
-H_BTN      = dp(48)   # touch target minimum recommande par Material Design
+H_BTN      = dp(48)
 H_LABEL    = dp(36)
 H_SECTION  = dp(40)
 H_INPUT    = dp(48)
-H_HEADER   = dp(56)   # toolbar Android standard
-H_BTN_GEN  = dp(56)   # bouton principal
+H_HEADER   = dp(56)
+H_BTN_GEN  = dp(56)
 H_SLIDER   = dp(48)
 H_SPACER   = dp(16)
+
+PAGE_GAP   = dp(8)   # espace entre pages dans le picker
 
 
 def make_btn(text, bg=C_GREY_BTN, fg=C_TEXT_DARK, size_hint_x=1,
@@ -237,7 +233,6 @@ def simulate_scan(img, tilt=1.2, blur=0.3, contrast=1.1, brightness=1.0, graysca
     else:
         if blur > 0:
             img = img.filter(ImageFilter.GaussianBlur(radius=blur))
-        # Grain couleur : applique sur chaque canal RGB
         img = img.convert("RGB")
         r, g, b = img.split()
         r = _pil_grain_L(r, strength=3)
@@ -300,8 +295,6 @@ def _android_pdf_page_to_pil(pdf_path, page_index=0, dpi=DPI_PREVIEW):
     width    = int(page.getWidth()  * scale)
     height   = int(page.getHeight() * scale)
 
-    # Creer un bitmap blanc opaque (ARGB_8888) et y dessiner un fond blanc
-    # avant le rendu PDF, pour eviter le fond noir sur les formulaires transparents
     bitmap = Bitmap.createBitmap(width, height, BitmapConfig.ARGB_8888)
     canvas = Canvas_java(bitmap)
     canvas.drawColor(Color_java.WHITE)
@@ -313,7 +306,6 @@ def _android_pdf_page_to_pil(pdf_path, page_index=0, dpi=DPI_PREVIEW):
     baos = ByteArrayOS()
     bitmap.compress(BitmapCompressFormat.PNG, 100, baos)
     img = Image.open(io.BytesIO(bytes(baos.toByteArray())))
-    # Securite supplementaire : aplatir RGBA sur blanc si encore present
     return ensure_white_bg(img)
 
 
@@ -370,8 +362,25 @@ def pdf_to_pil_list(pdf_path, dpi=DPI_PROCESS):
     raise RuntimeError("Aucun moteur PDF disponible")
 
 
+def pdf_preview_all_pages(pdf_path, dpi=DPI_PREVIEW):
+    """Charge toutes les pages du PDF a basse resolution pour la previsualisation."""
+    if ANDROID and HAS_JNIUS:
+        count = _android_pdf_page_count(pdf_path)
+        return [_android_pdf_page_to_pil(pdf_path, i, dpi) for i in range(count)]
+    elif HAS_FITZ:
+        doc    = fitz.open(pdf_path)
+        mat    = fitz.Matrix(dpi / 72, dpi / 72)
+        images = []
+        for page in doc:
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            images.append(ensure_white_bg(
+                Image.frombytes("RGB", (pix.width, pix.height), pix.samples)))
+        doc.close()
+        return images
+    raise RuntimeError("Aucun moteur PDF disponible")
+
+
 def pil_list_to_pdf(images, out):
-    """Sauvegarde en PDF. out = chemin (str) ou objet BytesIO."""
     if not images:
         return
     rgb = [img.convert("RGB") for img in images]
@@ -390,10 +399,15 @@ def pil_to_kivy_texture(pil_img):
 
 
 # -------------------------------------------------------------------------
-# WIDGET : ZONE DE DESSIN RECTANGLES (PickerCanvas)
+# WIDGET : CANVAS MULTI-PAGES SCROLLABLE (PickerCanvas)
 # -------------------------------------------------------------------------
 
 class PickerCanvas(Widget):
+    """
+    Affiche toutes les pages PDF empilees verticalement.
+    Encapsulee dans un ScrollView pour le defilement.
+    Le dessin de rectangles se fait sur la page touchee.
+    """
 
     COLOR_PARAFE = (0.62, 0.14, 0.80, 0.45)
     COLOR_SIG    = (0.18, 0.63, 0.18, 0.45)
@@ -402,53 +416,77 @@ class PickerCanvas(Widget):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.mode          = None
-        self.preview_pil   = None
-        self.preview_w     = 1
-        self.preview_h     = 1
-        self.scale_factor  = 1.0
-        self.dpi_ratio     = DPI_PROCESS / DPI_PREVIEW
-        self._rect_parafe_canvas = None
-        self._rect_sig_canvas    = None
-        self.rect_parafe = None
-        self.rect_sig    = None
-        self._drag_start  = None
-        self._live_coords = None
-        self._offset_x    = 0
-        self._offset_y    = 0
+        self.mode           = None
+        self.pages          = []      # liste de PIL Images
+        self.dpi_ratio      = DPI_PROCESS / DPI_PREVIEW
+        # rects par page : {page_idx: {"parafe": Rect|None, "sig": Rect|None}}
+        self._rects         = {}
+        # rects canvas (coords ecran) : {page_idx: {"parafe": tuple|None, "sig": tuple|None}}
+        self._rects_canvas  = {}
+        self._drag_start    = None
+        self._drag_page_idx = None
+        self._live_coords   = None
+        # geometrie calculee lors du redraw
+        self._page_geom     = []  # [(x_offset, y_offset, dw, dh), ...] en coords widget
         self.bind(size=self._redraw, pos=self._redraw)
 
-    def set_preview(self, pil_img):
-        self.preview_pil = pil_img
+    def set_pages(self, pages):
+        """Charge la liste de PIL Images et redimensionne le widget."""
+        self.pages = pages
+        self._rects        = {i: {"parafe": None, "sig": None} for i in range(len(pages))}
+        self._rects_canvas = {i: {"parafe": None, "sig": None} for i in range(len(pages))}
+        self._update_height()
         self._redraw()
+
+    def _update_height(self):
+        """Calcule la hauteur totale necessaire et la fixe sur le widget."""
+        if not self.pages:
+            self.height = dp(200)
+            return
+        avail_w = self.width if self.width > 1 else Window.width
+        total_h = 0
+        for img in self.pages:
+            scale  = avail_w / img.width
+            total_h += int(img.height * scale) + PAGE_GAP
+        self.height = total_h
 
     def _redraw(self, *_):
         self.canvas.clear()
-        if not self.preview_pil:
+        if not self.pages:
             return
-        sw = self.width  / self.preview_pil.width
-        sh = self.height / self.preview_pil.height
-        self.scale_factor = min(sw, sh)
-        dw = int(self.preview_pil.width  * self.scale_factor)
-        dh = int(self.preview_pil.height * self.scale_factor)
-        self._offset_x = (self.width  - dw) / 2 + self.x
-        self._offset_y = (self.height - dh) / 2 + self.y
-        self.preview_w = dw
-        self.preview_h = dh
-        tex = pil_to_kivy_texture(self.preview_pil)
-        with self.canvas:
-            Color(1, 1, 1, 1)
-            Rectangle(texture=tex, pos=(self._offset_x, self._offset_y), size=(dw, dh))
-        if self._rect_parafe_canvas:
-            self._draw_rect_canvas(*self._rect_parafe_canvas, self.COLOR_PARAFE, self.OUTLINE_P)
-        if self._rect_sig_canvas:
-            self._draw_rect_canvas(*self._rect_sig_canvas, self.COLOR_SIG, self.OUTLINE_S)
+        self._update_height()
+        avail_w = self.width if self.width > 1 else Window.width
+        self._page_geom = []
+        # Kivy : y=0 en bas. On empile les pages de HAUT en BAS
+        # donc la page 0 commence a y = self.height - dh
+        cursor_y = self.height  # on descend depuis le haut
+        for idx, img in enumerate(self.pages):
+            scale  = avail_w / img.width
+            dw     = int(img.width  * scale)
+            dh     = int(img.height * scale)
+            cursor_y -= dh
+            x_off = self.x + (avail_w - dw) / 2
+            y_off = self.y + cursor_y
+            self._page_geom.append((x_off, y_off, dw, dh, scale))
+            tex = pil_to_kivy_texture(img)
+            with self.canvas:
+                Color(1, 1, 1, 1)
+                Rectangle(texture=tex, pos=(x_off, y_off), size=(dw, dh))
+            cursor_y -= PAGE_GAP
+        # Dessiner les rects existants
+        for idx in range(len(self.pages)):
+            rc = self._rects_canvas.get(idx, {})
+            if rc.get("parafe"):
+                self._draw_rect(*rc["parafe"], self.COLOR_PARAFE, self.OUTLINE_P)
+            if rc.get("sig"):
+                self._draw_rect(*rc["sig"], self.COLOR_SIG, self.OUTLINE_S)
+        # Rect live en cours de dessin
         if self._live_coords:
             c = self.COLOR_PARAFE if self.mode == "parafe" else self.COLOR_SIG
             o = self.OUTLINE_P    if self.mode == "parafe" else self.OUTLINE_S
-            self._draw_rect_canvas(*self._live_coords, c, o)
+            self._draw_rect(*self._live_coords, c, o)
 
-    def _draw_rect_canvas(self, cx1, cy1, cx2, cy2, fill_color, outline_color):
+    def _draw_rect(self, cx1, cy1, cx2, cy2, fill_color, outline_color):
         x, y = min(cx1, cx2), min(cy1, cy2)
         w, h = abs(cx2 - cx1), abs(cy2 - cy1)
         with self.canvas:
@@ -457,21 +495,32 @@ class PickerCanvas(Widget):
             Color(*outline_color)
             Line(rectangle=(x, y, w, h), width=2)
 
-    def _canvas_to_preview(self, cx, cy):
-        px = (cx - self._offset_x) / self.scale_factor
-        py = (cy - self._offset_y) / self.scale_factor
-        return px, py
+    def _page_at(self, cx, cy):
+        """Retourne (page_idx, scale, x_off, y_off, dh) pour le point (cx, cy) en coords ecran."""
+        for idx, (x_off, y_off, dw, dh, scale) in enumerate(self._page_geom):
+            if x_off <= cx <= x_off + dw and y_off <= cy <= y_off + dh:
+                return idx, scale, x_off, y_off, dh
+        return None, None, None, None, None
 
-    def _canvas_to_real(self, cx, cy):
-        px, py = self._canvas_to_preview(cx, cy)
-        return int(px * self.dpi_ratio), int(py * self.dpi_ratio)
+    def _canvas_to_real(self, cx, cy, x_off, y_off, dh, scale):
+        """Convertit coords ecran -> coords reelles dans le PDF (en pixels DPI_PROCESS)."""
+        px = (cx - x_off) / scale  # px dans l'image preview
+        # Kivy y inversé : y=0 bas, PDF y=0 haut
+        py_preview = (cy - y_off) / scale
+        py_pdf     = (dh / scale) - py_preview
+        return int(px * self.dpi_ratio), int(py_pdf * self.dpi_ratio)
 
     def on_touch_down(self, touch):
         if not self.collide_point(*touch.pos) or not self.mode:
             return False
+        idx, scale, x_off, y_off, dh = self._page_at(*touch.pos)
+        if idx is None:
+            return False
         touch.grab(self)
-        self._drag_start  = touch.pos
-        self._live_coords = None
+        self._drag_start    = touch.pos
+        self._drag_page_idx = idx
+        self._drag_geom     = (scale, x_off, y_off, dh)
+        self._live_coords   = None
         return True
 
     def on_touch_move(self, touch):
@@ -489,33 +538,51 @@ class PickerCanvas(Widget):
         x1, y1 = touch.pos
         self._drag_start  = None
         self._live_coords = None
+        idx               = self._drag_page_idx
+        scale, x_off, y_off, dh = self._drag_geom
+
         if abs(x1 - x0) < 12 or abs(y1 - y0) < 12:
             self._redraw()
             return True
-        rx0, ry0 = self._canvas_to_real(min(x0, x1), min(y0, y1))
-        rx1, ry1 = self._canvas_to_real(max(x0, x1), max(y0, y1))
-        if self.preview_pil:
-            real_h = int(self.preview_pil.height * self.dpi_ratio)
-            ry0_f  = real_h - ry1
-            ry1_f  = real_h - ry0
-        else:
-            ry0_f, ry1_f = ry0, ry1
-        rect = Rect(rx0, ry0_f, rx1, ry1_f)
+
+        # coords reelles PDF (DPI_PROCESS)
+        rx0, ry0 = self._canvas_to_real(min(x0,x1), max(y0,y1), x_off, y_off, dh, scale)
+        rx1, ry1 = self._canvas_to_real(max(x0,x1), min(y0,y1), x_off, y_off, dh, scale)
+        rect = Rect(rx0, ry0, rx1, ry1)
+
+        canvas_coords = (min(x0,x1), min(y0,y1), max(x0,x1), max(y0,y1))
         if self.mode == "parafe":
-            self.rect_parafe         = rect
-            self._rect_parafe_canvas = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+            self._rects[idx]["parafe"]        = rect
+            self._rects_canvas[idx]["parafe"] = canvas_coords
         else:
-            self.rect_sig            = rect
-            self._rect_sig_canvas    = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+            self._rects[idx]["sig"]        = rect
+            self._rects_canvas[idx]["sig"] = canvas_coords
         self._redraw()
         return True
 
+    def get_rect(self, mode):
+        """Retourne le dernier Rect dessine pour ce mode (parafe/sig), toutes pages confondues."""
+        for idx in reversed(range(len(self.pages))):
+            r = self._rects.get(idx, {}).get(mode)
+            if r:
+                return r
+        return None
+
     def clear_rects(self):
-        self._rect_parafe_canvas = None
-        self._rect_sig_canvas    = None
-        self.rect_parafe         = None
-        self.rect_sig            = None
+        for idx in range(len(self.pages)):
+            self._rects[idx]        = {"parafe": None, "sig": None}
+            self._rects_canvas[idx] = {"parafe": None, "sig": None}
         self._redraw()
+
+    def restore_rects(self, parafe_rect, sig_rect):
+        """Reaffiche les rects deja definis (retour sur l'ecran picker)."""
+        # On les pose sur la page 0 visuellement si pas de page connue
+        if parafe_rect and self.pages:
+            self._rects[0]["parafe"] = parafe_rect
+        if sig_rect and self.pages:
+            self._rects[0]["sig"] = sig_rect
+        # Pas de coords canvas disponibles -> pas de reaffichage visuel des anciens
+        # (ils seront redefinis par l'utilisateur si besoin)
 
 
 # -------------------------------------------------------------------------
@@ -531,6 +598,7 @@ class PickerScreen(Screen):
     def _build_ui(self):
         root = BoxLayout(orientation="vertical", spacing=0)
 
+        # -- Barre de boutons --
         bar = BoxLayout(orientation="horizontal", size_hint_y=None, height=H_BTN,
                         spacing=4, padding=(4, 4))
         with bar.canvas.before:
@@ -552,22 +620,33 @@ class PickerScreen(Screen):
             bar.add_widget(w)
         root.add_widget(bar)
 
+        # -- Label statut --
         self.status_lbl = make_label(
             "Choisir un mode, puis glisser pour delimiter la zone",
             color=(0.3, 0.3, 0.3, 1), height=H_LABEL, halign="center"
         )
         root.add_widget(self.status_lbl)
 
-        self.picker = PickerCanvas()
-        root.add_widget(self.picker)
+        # -- ScrollView contenant le PickerCanvas --
+        self.scroll = ScrollView(
+            size_hint=(1, 1),
+            do_scroll_x=False,
+            do_scroll_y=True,
+            scroll_type=["bars", "content"],
+        )
+        self.picker = PickerCanvas(size_hint=(1, None))
+        # Le canvas se redimensionne automatiquement via _update_height
+        self.scroll.add_widget(self.picker)
+        root.add_widget(self.scroll)
+
         self.add_widget(root)
 
     def _set_mode(self, mode):
         self.picker.mode = mode
         if mode == "parafe":
-            self.status_lbl.text = "Mode PARAFE actif - glisser pour delimiter"
+            self.status_lbl.text = "Mode PARAFE — glisser sur la page souhaitee"
         else:
-            self.status_lbl.text = "Mode SIGNATURE actif - glisser pour delimiter"
+            self.status_lbl.text = "Mode SIGNATURE — glisser sur la page souhaitee"
 
     def _clear(self):
         self.picker.clear_rects()
@@ -576,31 +655,45 @@ class PickerScreen(Screen):
 
     def _validate(self):
         app = App.get_running_app()
-        app.parafe_rect = self.picker.rect_parafe
-        app.sig_rect    = self.picker.rect_sig
+        app.parafe_rect = self.picker.get_rect("parafe")
+        app.sig_rect    = self.picker.get_rect("sig")
         app.sm.transition = SlideTransition(direction="right")
         app.sm.current = "main"
         app.main_screen.refresh_zones_label()
 
     def load_pdf_preview(self, pdf_path):
-        try:
-            img = pdf_page_to_pil(pdf_path, page_index=0, dpi=DPI_PREVIEW)
-            self.picker.set_preview(img)
-            app = App.get_running_app()
-            self.picker.rect_parafe = app.parafe_rect
-            self.picker.rect_sig    = app.sig_rect
-        except Exception as exc:
-            self.status_lbl.text = "Erreur apercu : " + str(exc)
+        """Charge toutes les pages en thread pour ne pas bloquer l'UI."""
+        self.status_lbl.text = "Chargement des pages..."
+        self.picker.pages = []
+        self.picker.canvas.clear()
+
+        def _load():
+            try:
+                pages = pdf_preview_all_pages(pdf_path, dpi=DPI_PREVIEW)
+                def _done(dt):
+                    self.picker.set_pages(pages)
+                    app = App.get_running_app()
+                    self.picker.restore_rects(app.parafe_rect, app.sig_rect)
+                    n = len(pages)
+                    self.status_lbl.text = (
+                        "{} page{} — choisir un mode puis glisser".format(
+                            n, "s" if n > 1 else "")
+                    )
+                Clock.schedule_once(_done)
+            except Exception as exc:
+                Clock.schedule_once(
+                    lambda dt, e=str(exc): setattr(
+                        self.status_lbl, "text", "Erreur : " + e))
+
+        threading.Thread(target=_load, daemon=True).start()
 
 
 # -------------------------------------------------------------------------
 # SELECTEUR DE FICHIER NATIF ANDROID
 # -------------------------------------------------------------------------
 
-# Callback global pour recevoir le resultat de l'Intent
 _file_picker_callback = None
-# FIX: stocker separement si la selection en cours est un PDF ou une image
-_file_picker_is_pdf = False
+_file_picker_is_pdf   = False
 
 if ANDROID:
     from android.activity import bind as activity_bind  # type: ignore
@@ -609,20 +702,16 @@ if ANDROID:
         global _file_picker_callback, _file_picker_is_pdf
         RESULT_OK = -1
         if requestCode == 42 and resultCode == RESULT_OK and intent and _file_picker_callback:
-            uri  = intent.getData()
-            cb   = _file_picker_callback
+            uri    = intent.getData()
+            cb     = _file_picker_callback
             is_pdf = _file_picker_is_pdf
             _file_picker_callback = None
             _file_picker_is_pdf   = False
-
-            # Resoudre l'URI en chemin reel
             try:
                 ContentResolver  = autoclass("android.content.ContentResolver")
                 PythonActivity   = autoclass("org.kivy.android.PythonActivity")
                 context          = PythonActivity.mActivity
                 resolver         = context.getContentResolver()
-
-                # Essayer d'obtenir le chemin via cursor
                 cursor = resolver.query(uri, None, None, None, None)
                 path   = None
                 real_name = None
@@ -641,8 +730,6 @@ if ANDROID:
                     except Exception:
                         pass
                     cursor.close()
-
-                # Si pas de chemin direct, copier vers cache
                 if not path:
                     import tempfile
                     istream = resolver.openInputStream(uri)
@@ -663,26 +750,18 @@ if ANDROID:
                     tmp.close()
                     istream.close()
                     path = tmp.name
-
-                # FIX: ne stocker pdf_display_name QUE si on selectionne un PDF
                 if is_pdf:
                     try:
-                        if real_name:
-                            display_name = real_name
-                        else:
-                            seg = uri.getLastPathSegment()
-                            if seg:
-                                display_name = seg
+                        display_name = real_name or uri.getLastPathSegment()
                     except Exception:
                         pass
                     if not display_name and path:
                         display_name = os.path.basename(path)
                     if display_name:
                         App.get_running_app().pdf_display_name = display_name
-
                 if path:
                     Clock.schedule_once(lambda dt: cb(path))
-            except Exception as exc:
+            except Exception:
                 import traceback
                 traceback.print_exc()
 
@@ -690,7 +769,6 @@ if ANDROID:
 
 
 def open_file_picker(callback, mime_type="*/*"):
-    """Ouvre le selecteur de fichier natif Android ou un FilePopup sur desktop."""
     global _file_picker_callback, _file_picker_is_pdf
     if ANDROID and HAS_JNIUS:
         _file_picker_callback = callback
@@ -702,11 +780,7 @@ def open_file_picker(callback, mime_type="*/*"):
         intent.addCategory(Intent.CATEGORY_OPENABLE)
         PythonActivity.mActivity.startActivityForResult(intent, 42)
     else:
-        # Desktop : popup Kivy classique
-        if mime_type == "application/pdf":
-            filters = ["*.pdf"]
-        else:
-            filters = ["*.png", "*.jpg", "*.jpeg"]
+        filters = ["*.pdf"] if mime_type == "application/pdf" else ["*.png", "*.jpg", "*.jpeg"]
         FilePopup(callback, filters=filters).open()
 
 
@@ -721,16 +795,13 @@ class FilePopup(Popup):
         self.callback  = callback
         self.title     = "Choisir un fichier"
         self.size_hint = (0.95, 0.85)
-
         layout = BoxLayout(orientation="vertical", spacing=8, padding=8)
-        start_path = self._get_start_path()
         self.chooser = FileChooserListView(
-            path=start_path,
+            path=self._get_start_path(),
             filters=filters or ["*"],
             size_hint_y=1,
         )
         layout.add_widget(self.chooser)
-
         btn_row = BoxLayout(size_hint_y=None, height=H_BTN, spacing=8)
         btn_row.add_widget(make_btn("Annuler",      bg=C_RED,   fg=C_WHITE,
                                     on_press=lambda _: self.dismiss()))
@@ -764,11 +835,9 @@ class NamedSlider(BoxLayout):
                          height=H_SLIDER, spacing=6, **kwargs)
         self._lbl = make_label(label, height=H_SLIDER, halign="left")
         self._lbl.size_hint_x = 0.38
-
         self.slider = Slider(min=lo, max=hi, value=value, step=step, size_hint_x=0.44)
         self._val_lbl = make_label("{:.2f}".format(value), height=H_SLIDER, halign="right")
         self._val_lbl.size_hint_x = 0.18
-
         self.slider.bind(value=self._on_value)
         self.add_widget(self._lbl)
         self.add_widget(self.slider)
@@ -866,7 +935,6 @@ class MainScreen(Screen):
 
         content.add_widget(section_label("Effets scan"))
 
-        # Toggle Noir & Blanc / Couleurs
         from kivy.uix.togglebutton import ToggleButton
         toggle_row = BoxLayout(size_hint_y=None, height=H_BTN, spacing=dp(6))
         self.btn_nb  = ToggleButton(
@@ -907,7 +975,6 @@ class MainScreen(Screen):
         self.progress_lbl = make_label("", color=(0.4, 0.4, 0.4, 1),
                                        height=H_LABEL, halign="center", italic=True)
         content.add_widget(self.progress_lbl)
-
         content.add_widget(Widget(size_hint_y=None, height=H_SPACER))
 
         scroll.add_widget(content)
@@ -1022,7 +1089,6 @@ class MainScreen(Screen):
                     lambda dt, n=page_num, t=total: self._prog("Page {}/{}...".format(n, t))
                 )
 
-                # -- FIX : aplatir transparence sur fond blanc AVANT tout traitement --
                 page_img = ensure_white_bg(page_img)
                 page_img = page_img.convert("RGBA")
 
@@ -1045,7 +1111,6 @@ class MainScreen(Screen):
                 out_images.append(page_img.convert("RGB"))
 
             out_filename = os.path.splitext(p["pdf_name"])[0] + "_scan.pdf"
-
             Clock.schedule_once(lambda dt: self._prog("Encodage PDF..."))
 
             if ANDROID and HAS_JNIUS:
@@ -1055,34 +1120,25 @@ class MainScreen(Screen):
                     PythonActivity = autoclass("org.kivy.android.PythonActivity")
                     context        = PythonActivity.mActivity
                     resolver       = context.getContentResolver()
-
                     values = ContentValues()
                     values.put("_display_name", out_filename)
                     values.put("mime_type",     "application/pdf")
                     values.put("relative_path", "Download/")
-
                     try:
                         resolver.delete(
                             Downloads.EXTERNAL_CONTENT_URI,
-                            "_display_name=?", [out_filename]
-                        )
+                            "_display_name=?", [out_filename])
                     except Exception:
                         pass
-
-                    item_uri = resolver.insert(
-                        Downloads.EXTERNAL_CONTENT_URI, values)
-
-                    ostream = resolver.openOutputStream(item_uri)
-                    buf = io.BytesIO()
+                    item_uri = resolver.insert(Downloads.EXTERNAL_CONTENT_URI, values)
+                    ostream  = resolver.openOutputStream(item_uri)
+                    buf      = io.BytesIO()
                     pil_list_to_pdf(out_images, buf)
                     ostream.write(buf.getvalue())
                     ostream.close()
-
                     content_uri_str = item_uri.toString()
                     Clock.schedule_once(
-                        lambda dt, n=out_filename, u=content_uri_str:
-                            self._on_done(n, u))
-
+                        lambda dt, n=out_filename, u=content_uri_str: self._on_done(n, u))
                 except Exception:
                     import traceback; traceback.print_exc()
                     Environment = autoclass("android.os.Environment")
@@ -1113,12 +1169,8 @@ class MainScreen(Screen):
             size_hint_y=None, height=dp(72),
         ))
         btn_row = BoxLayout(size_hint_y=None, height=H_BTN, spacing=dp(8))
-        popup = Popup(
-            title="Termine",
-            content=content,
-            size_hint=(0.88, None),
-            height=dp(210),
-        )
+        popup   = Popup(title="Termine", content=content,
+                        size_hint=(0.88, None), height=dp(210))
 
         def _open_pdf(_):
             popup.dismiss()
@@ -1134,30 +1186,24 @@ class MainScreen(Screen):
                     intent.setDataAndType(uri, "application/pdf")
                     intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                     intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    ctx.startActivity(
-                        Intent.createChooser(intent, JavaString("Ouvrir avec")))
+                    ctx.startActivity(Intent.createChooser(intent, JavaString("Ouvrir avec")))
                 except Exception as exc:
                     self._toast("Erreur : " + str(exc), duration=4)
             else:
                 self._toast("Fichier : Telechargements/" + out_filename, duration=5)
 
-        btn_open  = make_btn("Ouvrir",  bg=C_GREEN,    fg=C_WHITE,
-                             on_press=_open_pdf)
-        btn_close = make_btn("Fermer",  bg=C_GREY_BTN, fg=C_TEXT_DARK,
-                             on_press=lambda _: popup.dismiss())
-        btn_row.add_widget(btn_open)
-        btn_row.add_widget(btn_close)
+        btn_row.add_widget(make_btn("Ouvrir", bg=C_GREEN,    fg=C_WHITE, on_press=_open_pdf))
+        btn_row.add_widget(make_btn("Fermer", bg=C_GREY_BTN, fg=C_TEXT_DARK,
+                                    on_press=lambda _: popup.dismiss()))
         content.add_widget(btn_row)
         popup.open()
 
     def _on_error(self, err):
         self._reset_btn()
-        Popup(
-            title="Erreur",
-            content=Label(text=err, font_size=FS_POPUP,
-                          text_size=(Window.width * 0.85, None)),
-            size_hint=(0.9, 0.7)
-        ).open()
+        Popup(title="Erreur",
+              content=Label(text=err, font_size=FS_POPUP,
+                            text_size=(Window.width * 0.85, None)),
+              size_hint=(0.9, 0.7)).open()
 
     def _reset_btn(self):
         self.btn_gen.disabled = False
@@ -1172,8 +1218,7 @@ class MainScreen(Screen):
             title="",
             content=Label(text=msg, halign="center", font_size=FS_POPUP),
             size_hint=(0.8, None), height=H_BTN * 2,
-            auto_dismiss=True,
-            separator_height=0,
+            auto_dismiss=True, separator_height=0,
         )
         pop.open()
         Clock.schedule_once(lambda dt: pop.dismiss(), duration)
@@ -1188,22 +1233,18 @@ class FakeScanApp(App):
     def build(self):
         self.pdf_path         = None
         self.pdf_display_name = None
-        self.parafe_path = None
-        self.sig_path    = None
-        self.total_pages = 999
-        self.parafe_rect = None
-        self.sig_rect    = None
+        self.parafe_path      = None
+        self.sig_path         = None
+        self.total_pages      = 999
+        self.parafe_rect      = None
+        self.sig_rect         = None
 
         if ANDROID and not HAS_JNIUS:
-            return Label(
-                text="[b]Erreur :[/b]\nJnius non disponible.",
-                markup=True, halign="center", font_size=FS_POPUP
-            )
+            return Label(text="[b]Erreur :[/b]\nJnius non disponible.",
+                         markup=True, halign="center", font_size=FS_POPUP)
         if not ANDROID and not HAS_FITZ:
-            return Label(
-                text="[b]Erreur :[/b]\nPyMuPDF non installe.\n\npip install pymupdf",
-                markup=True, halign="center", font_size=FS_POPUP
-            )
+            return Label(text="[b]Erreur :[/b]\nPyMuPDF non installe.\n\npip install pymupdf",
+                         markup=True, halign="center", font_size=FS_POPUP)
 
         self.sm = ScreenManager()
         self.main_screen   = MainScreen(name="main")
