@@ -34,21 +34,29 @@ jobs:
       - name: Inject keystore passwords into buildozer.spec
         env:
           KEYSTORE_PASSWD: ${{ secrets.KEYSTORE_PASSWD }}
-          KEYALIAS_PASSWD: ${{ secrets.KEYALIAS_PASSWD }}
         run: |
           sed -i "s|YOUR_PASSWORD|$KEYSTORE_PASSWD|g" buildozer.spec
 
       - name: Build Release APK via kivy/buildozer Docker image
+        env:
+          KEYSTORE_PASSWD: ${{ secrets.KEYSTORE_PASSWD }}
+          KEYALIAS_PASSWD: ${{ secrets.KEYALIAS_PASSWD }}
         run: |
           docker run --rm \
             --entrypoint /bin/sh \
             -v ${{ github.workspace }}:/home/user/hostcwd \
             -e HOME=/home/user/hostcwd \
+            -e P4A_RELEASE_KEYSTORE=/home/user/hostcwd/fakescan.keystore \
+            -e P4A_RELEASE_KEYALIAS=fakescan \
+            -e P4A_RELEASE_KEYSTORE_PASSWD=$KEYSTORE_PASSWD \
+            -e P4A_RELEASE_KEYALIAS_PASSWD=$KEYALIAS_PASSWD \
             ghcr.io/kivy/buildozer:latest \
             -c "git config --global --add safe.directory '*' && yes | /home/user/.venv/bin/python -m buildozer android release"
 
       - name: Find APK
         run: |
+          echo "--- Contenu de bin/ ---"
+          ls -lh ${{ github.workspace }}/bin/ || echo "Dossier bin/ vide ou absent"
           APK=$(find ${{ github.workspace }}/bin -name "*.apk" | head -1)
           echo "APK_PATH=$APK" >> $GITHUB_ENV
           echo "Found: $APK"
@@ -58,6 +66,7 @@ jobs:
         with:
           name: fakescan-release-apk
           path: bin/*.apk
+          if-no-files-found: error
           retention-days: 30
 
   release:
