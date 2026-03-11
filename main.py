@@ -208,7 +208,7 @@ def vary_signature(base_img):
 def fit_into_rect(img, rect, jitter=True):
     scale = min(rect.w / img.width, rect.h / img.height)
     nw, nh = int(img.width * scale), int(img.height * scale)
-    img_r = img.resize((nw, nh), Image.Resampling.LANCZOS)
+    img_r = img.resize((nw, nh), Image.LANCZOS)
     cx = rect.x1 + (rect.w - nw) // 2
     cy = rect.y1 + (rect.h - nh) // 2
     if jitter:
@@ -226,8 +226,8 @@ def simulate_scan(img, tilt=1.2, blur=0.3, contrast=1.1, brightness=1.0):
     img = ImageEnhance.Contrast(img).enhance(contrast + random.uniform(-0.05, 0.05))
     img = ImageEnhance.Brightness(img).enhance(brightness + random.uniform(-0.02, 0.02))
     w, h = img.size
-    img = img.resize((int(w * 0.95), int(h * 0.95)), Image.Resampling.LANCZOS)
-    img = img.resize((w, h), Image.Resampling.LANCZOS)
+    img = img.resize((int(w * 0.95), int(h * 0.95)), Image.LANCZOS)
+    img = img.resize((w, h), Image.LANCZOS)
     return img
 
 
