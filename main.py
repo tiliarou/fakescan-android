@@ -49,6 +49,19 @@ if ANDROID:
     try:
         from jnius import autoclass
         HAS_JNIUS = True
+
+        # -- Toutes les classes Java chargees UNE SEULE FOIS au demarrage --
+        _File                 = autoclass("java.io.File")
+        _ParcelFileDescriptor = autoclass("android.os.ParcelFileDescriptor")
+        _PdfRenderer          = autoclass("android.graphics.pdf.PdfRenderer")
+        _PdfRendererPage      = autoclass("android.graphics.pdf.PdfRenderer$Page")
+        _Bitmap               = autoclass("android.graphics.Bitmap")
+        _BitmapConfig         = autoclass("android.graphics.Bitmap$Config")
+        _BitmapCompressFormat = autoclass("android.graphics.Bitmap$CompressFormat")
+        _ByteArrayOS          = autoclass("java.io.ByteArrayOutputStream")
+        _Color_java           = autoclass("android.graphics.Color")
+        _Canvas_java          = autoclass("android.graphics.Canvas")
+
     except ImportError:
         HAS_JNIUS = False
     HAS_FITZ = False
@@ -280,39 +293,31 @@ def _android_render_page(renderer, page_index, dpi):
     """
     Rend une page depuis un PdfRenderer DEJA OUVERT.
     NE ferme PAS le renderer. Retourne une PIL Image RGB.
+    Utilise les classes Java pre-chargees au niveau module.
     """
-    PdfRendererPage  = autoclass("android.graphics.pdf.PdfRenderer$Page")
-    Bitmap           = autoclass("android.graphics.Bitmap")
-    BitmapConfig     = autoclass("android.graphics.Bitmap$Config")
-    BitmapCompressFormat = autoclass("android.graphics.Bitmap$CompressFormat")
-    ByteArrayOS      = autoclass("java.io.ByteArrayOutputStream")
-    Color_java       = autoclass("android.graphics.Color")
-    Canvas_java      = autoclass("android.graphics.Canvas")
-
     page   = renderer.openPage(page_index)
     scale  = dpi / 72.0
     width  = int(page.getWidth()  * scale)
     height = int(page.getHeight() * scale)
 
-    bitmap = Bitmap.createBitmap(width, height, BitmapConfig.ARGB_8888)
-    canvas = Canvas_java(bitmap)
-    canvas.drawColor(Color_java.WHITE)
-    page.render(bitmap, None, None, PdfRendererPage.RENDER_MODE_FOR_DISPLAY)
+    bitmap = _Bitmap.createBitmap(width, height, _BitmapConfig.ARGB_8888)
+    canvas = _Canvas_java(bitmap)
+    canvas.drawColor(_Color_java.WHITE)
+    # RENDER_MODE_FOR_PRINT (1) est plus stable que FOR_DISPLAY (0)
+    # sur les PDFs complexes (evite l'erreur "Invalid ID")
+    page.render(bitmap, None, None, _PdfRendererPage.RENDER_MODE_FOR_PRINT)
     page.close()   # fermer la PAGE (obligatoire avant d'en ouvrir une autre)
 
-    baos = ByteArrayOS()
-    bitmap.compress(BitmapCompressFormat.PNG, 100, baos)
+    baos = _ByteArrayOS()
+    bitmap.compress(_BitmapCompressFormat.PNG, 100, baos)
     img = Image.open(io.BytesIO(bytes(baos.toByteArray())))
     return ensure_white_bg(img)
 
 
 def _android_open_renderer(pdf_path):
     """Ouvre et retourne (renderer, pfd) pour pdf_path. A fermer apres usage."""
-    File                 = autoclass("java.io.File")
-    ParcelFileDescriptor = autoclass("android.os.ParcelFileDescriptor")
-    PdfRenderer          = autoclass("android.graphics.pdf.PdfRenderer")
-    pfd      = ParcelFileDescriptor.open(File(pdf_path), ParcelFileDescriptor.MODE_READ_ONLY)
-    renderer = PdfRenderer(pfd)
+    pfd      = _ParcelFileDescriptor.open(_File(pdf_path), _ParcelFileDescriptor.MODE_READ_ONLY)
+    renderer = _PdfRenderer(pfd)
     return renderer, pfd
 
 
