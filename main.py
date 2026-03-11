@@ -1015,7 +1015,7 @@ class MainScreen(Screen):
                 # → retourne un content:// URI utilisable directement pour ouvrir
                 try:
                     ContentValues  = autoclass("android.content.ContentValues")
-                    MediaStore     = autoclass("android.provider.MediaStore")
+                    Downloads      = autoclass("android.provider.MediaStore$Downloads")
                     PythonActivity = autoclass("org.kivy.android.PythonActivity")
                     context        = PythonActivity.mActivity
                     resolver       = context.getContentResolver()
@@ -1028,14 +1028,14 @@ class MainScreen(Screen):
                     # Supprimer l'entrée existante si même nom
                     try:
                         resolver.delete(
-                            MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                            Downloads.EXTERNAL_CONTENT_URI,
                             "_display_name=?", [out_filename]
                         )
                     except Exception:
                         pass
 
                     item_uri = resolver.insert(
-                        MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                        Downloads.EXTERNAL_CONTENT_URI, values)
 
                     ostream = resolver.openOutputStream(item_uri)
                     buf = io.BytesIO()
