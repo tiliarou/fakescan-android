@@ -276,49 +276,81 @@ DPI_PREVIEW = 100
 DPI_PROCESS = 250
 
 
-def _android_pdf_page_to_pil(pdf_path, page_index=0, dpi=DPI_PREVIEW):
-    File                 = autoclass("java.io.File")
-    ParcelFileDescriptor = autoclass("android.os.ParcelFileDescriptor")
-    PdfRenderer          = autoclass("android.graphics.pdf.PdfRenderer")
-    PdfRendererPage      = autoclass("android.graphics.pdf.PdfRenderer$Page")
-    Bitmap               = autoclass("android.graphics.Bitmap")
-    BitmapConfig         = autoclass("android.graphics.Bitmap$Config")
+def _android_render_page(renderer, page_index, dpi):
+    """
+    Rend une page depuis un PdfRenderer DEJA OUVERT.
+    NE ferme PAS le renderer. Retourne une PIL Image RGB.
+    """
+    PdfRendererPage  = autoclass("android.graphics.pdf.PdfRenderer$Page")
+    Bitmap           = autoclass("android.graphics.Bitmap")
+    BitmapConfig     = autoclass("android.graphics.Bitmap$Config")
     BitmapCompressFormat = autoclass("android.graphics.Bitmap$CompressFormat")
-    ByteArrayOS          = autoclass("java.io.ByteArrayOutputStream")
-    Color_java           = autoclass("android.graphics.Color")
-    Canvas_java          = autoclass("android.graphics.Canvas")
+    ByteArrayOS      = autoclass("java.io.ByteArrayOutputStream")
+    Color_java       = autoclass("android.graphics.Color")
+    Canvas_java      = autoclass("android.graphics.Canvas")
 
-    pfd      = ParcelFileDescriptor.open(File(pdf_path), ParcelFileDescriptor.MODE_READ_ONLY)
-    renderer = PdfRenderer(pfd)
-    page     = renderer.openPage(page_index)
-    scale    = dpi / 72.0
-    width    = int(page.getWidth()  * scale)
-    height   = int(page.getHeight() * scale)
+    page   = renderer.openPage(page_index)
+    scale  = dpi / 72.0
+    width  = int(page.getWidth()  * scale)
+    height = int(page.getHeight() * scale)
 
     bitmap = Bitmap.createBitmap(width, height, BitmapConfig.ARGB_8888)
     canvas = Canvas_java(bitmap)
     canvas.drawColor(Color_java.WHITE)
-
     page.render(bitmap, None, None, PdfRendererPage.RENDER_MODE_FOR_DISPLAY)
-    page.close()
-    renderer.close()
-    pfd.close()
+    page.close()   # fermer la PAGE (obligatoire avant d'en ouvrir une autre)
+
     baos = ByteArrayOS()
     bitmap.compress(BitmapCompressFormat.PNG, 100, baos)
     img = Image.open(io.BytesIO(bytes(baos.toByteArray())))
     return ensure_white_bg(img)
 
 
-def _android_pdf_page_count(pdf_path):
+def _android_open_renderer(pdf_path):
+    """Ouvre et retourne (renderer, pfd) pour pdf_path. A fermer apres usage."""
     File                 = autoclass("java.io.File")
     ParcelFileDescriptor = autoclass("android.os.ParcelFileDescriptor")
     PdfRenderer          = autoclass("android.graphics.pdf.PdfRenderer")
     pfd      = ParcelFileDescriptor.open(File(pdf_path), ParcelFileDescriptor.MODE_READ_ONLY)
     renderer = PdfRenderer(pfd)
-    count    = renderer.getPageCount()
+    return renderer, pfd
+
+
+def _android_pdf_page_count(pdf_path):
+    renderer, pfd = _android_open_renderer(pdf_path)
+    count = renderer.getPageCount()
     renderer.close()
     pfd.close()
     return count
+
+
+def _android_pdf_page_to_pil(pdf_path, page_index=0, dpi=DPI_PREVIEW):
+    """Rend une seule page (ouvre/ferme le renderer). Usage : apercu page unique."""
+    renderer, pfd = _android_open_renderer(pdf_path)
+    try:
+        img = _android_render_page(renderer, page_index, dpi)
+    finally:
+        renderer.close()
+        pfd.close()
+    return img
+
+
+def _android_pdf_all_pages(pdf_path, dpi):
+    """
+    Rend TOUTES les pages en ouvrant le renderer UNE SEULE FOIS.
+    Corrige l'erreur 'Invalid ID' qui survenait quand on ouvrait
+    un renderer par page.
+    """
+    renderer, pfd = _android_open_renderer(pdf_path)
+    images = []
+    try:
+        count = renderer.getPageCount()
+        for i in range(count):
+            images.append(_android_render_page(renderer, i, dpi))
+    finally:
+        renderer.close()
+        pfd.close()
+    return images
 
 
 def pdf_page_count(pdf_path):
@@ -347,9 +379,10 @@ def pdf_page_to_pil(pdf_path, page_index=0, dpi=DPI_PREVIEW):
 
 
 def pdf_to_pil_list(pdf_path, dpi=DPI_PROCESS):
+    """Rend toutes les pages a haute resolution (generation finale)."""
     if ANDROID and HAS_JNIUS:
-        count = _android_pdf_page_count(pdf_path)
-        return [_android_pdf_page_to_pil(pdf_path, i, dpi) for i in range(count)]
+        # Renderer ouvert une seule fois pour toutes les pages
+        return _android_pdf_all_pages(pdf_path, dpi)
     elif HAS_FITZ:
         doc    = fitz.open(pdf_path)
         mat    = fitz.Matrix(dpi / 72, dpi / 72)
@@ -363,10 +396,10 @@ def pdf_to_pil_list(pdf_path, dpi=DPI_PROCESS):
 
 
 def pdf_preview_all_pages(pdf_path, dpi=DPI_PREVIEW):
-    """Charge toutes les pages du PDF a basse resolution pour la previsualisation."""
+    """Rend toutes les pages a basse resolution pour la previsualisation."""
     if ANDROID and HAS_JNIUS:
-        count = _android_pdf_page_count(pdf_path)
-        return [_android_pdf_page_to_pil(pdf_path, i, dpi) for i in range(count)]
+        # Renderer ouvert une seule fois pour toutes les pages
+        return _android_pdf_all_pages(pdf_path, dpi)
     elif HAS_FITZ:
         doc    = fitz.open(pdf_path)
         mat    = fitz.Matrix(dpi / 72, dpi / 72)
@@ -417,21 +450,18 @@ class PickerCanvas(Widget):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.mode           = None
-        self.pages          = []      # liste de PIL Images
+        self.pages          = []
         self.dpi_ratio      = DPI_PROCESS / DPI_PREVIEW
-        # rects par page : {page_idx: {"parafe": Rect|None, "sig": Rect|None}}
         self._rects         = {}
-        # rects canvas (coords ecran) : {page_idx: {"parafe": tuple|None, "sig": tuple|None}}
         self._rects_canvas  = {}
         self._drag_start    = None
         self._drag_page_idx = None
+        self._drag_geom     = None
         self._live_coords   = None
-        # geometrie calculee lors du redraw
-        self._page_geom     = []  # [(x_offset, y_offset, dw, dh), ...] en coords widget
+        self._page_geom     = []
         self.bind(size=self._redraw, pos=self._redraw)
 
     def set_pages(self, pages):
-        """Charge la liste de PIL Images et redimensionne le widget."""
         self.pages = pages
         self._rects        = {i: {"parafe": None, "sig": None} for i in range(len(pages))}
         self._rects_canvas = {i: {"parafe": None, "sig": None} for i in range(len(pages))}
@@ -439,14 +469,13 @@ class PickerCanvas(Widget):
         self._redraw()
 
     def _update_height(self):
-        """Calcule la hauteur totale necessaire et la fixe sur le widget."""
         if not self.pages:
             self.height = dp(200)
             return
         avail_w = self.width if self.width > 1 else Window.width
         total_h = 0
         for img in self.pages:
-            scale  = avail_w / img.width
+            scale   = avail_w / img.width
             total_h += int(img.height * scale) + PAGE_GAP
         self.height = total_h
 
@@ -457,13 +486,11 @@ class PickerCanvas(Widget):
         self._update_height()
         avail_w = self.width if self.width > 1 else Window.width
         self._page_geom = []
-        # Kivy : y=0 en bas. On empile les pages de HAUT en BAS
-        # donc la page 0 commence a y = self.height - dh
-        cursor_y = self.height  # on descend depuis le haut
+        cursor_y = self.height
         for idx, img in enumerate(self.pages):
-            scale  = avail_w / img.width
-            dw     = int(img.width  * scale)
-            dh     = int(img.height * scale)
+            scale    = avail_w / img.width
+            dw       = int(img.width  * scale)
+            dh       = int(img.height * scale)
             cursor_y -= dh
             x_off = self.x + (avail_w - dw) / 2
             y_off = self.y + cursor_y
@@ -473,14 +500,12 @@ class PickerCanvas(Widget):
                 Color(1, 1, 1, 1)
                 Rectangle(texture=tex, pos=(x_off, y_off), size=(dw, dh))
             cursor_y -= PAGE_GAP
-        # Dessiner les rects existants
         for idx in range(len(self.pages)):
             rc = self._rects_canvas.get(idx, {})
             if rc.get("parafe"):
                 self._draw_rect(*rc["parafe"], self.COLOR_PARAFE, self.OUTLINE_P)
             if rc.get("sig"):
                 self._draw_rect(*rc["sig"], self.COLOR_SIG, self.OUTLINE_S)
-        # Rect live en cours de dessin
         if self._live_coords:
             c = self.COLOR_PARAFE if self.mode == "parafe" else self.COLOR_SIG
             o = self.OUTLINE_P    if self.mode == "parafe" else self.OUTLINE_S
@@ -496,16 +521,13 @@ class PickerCanvas(Widget):
             Line(rectangle=(x, y, w, h), width=2)
 
     def _page_at(self, cx, cy):
-        """Retourne (page_idx, scale, x_off, y_off, dh) pour le point (cx, cy) en coords ecran."""
         for idx, (x_off, y_off, dw, dh, scale) in enumerate(self._page_geom):
             if x_off <= cx <= x_off + dw and y_off <= cy <= y_off + dh:
                 return idx, scale, x_off, y_off, dh
         return None, None, None, None, None
 
     def _canvas_to_real(self, cx, cy, x_off, y_off, dh, scale):
-        """Convertit coords ecran -> coords reelles dans le PDF (en pixels DPI_PROCESS)."""
-        px = (cx - x_off) / scale  # px dans l'image preview
-        # Kivy y inversé : y=0 bas, PDF y=0 haut
+        px         = (cx - x_off) / scale
         py_preview = (cy - y_off) / scale
         py_pdf     = (dh / scale) - py_preview
         return int(px * self.dpi_ratio), int(py_pdf * self.dpi_ratio)
@@ -545,12 +567,11 @@ class PickerCanvas(Widget):
             self._redraw()
             return True
 
-        # coords reelles PDF (DPI_PROCESS)
         rx0, ry0 = self._canvas_to_real(min(x0,x1), max(y0,y1), x_off, y_off, dh, scale)
         rx1, ry1 = self._canvas_to_real(max(x0,x1), min(y0,y1), x_off, y_off, dh, scale)
-        rect = Rect(rx0, ry0, rx1, ry1)
-
+        rect         = Rect(rx0, ry0, rx1, ry1)
         canvas_coords = (min(x0,x1), min(y0,y1), max(x0,x1), max(y0,y1))
+
         if self.mode == "parafe":
             self._rects[idx]["parafe"]        = rect
             self._rects_canvas[idx]["parafe"] = canvas_coords
@@ -561,7 +582,6 @@ class PickerCanvas(Widget):
         return True
 
     def get_rect(self, mode):
-        """Retourne le dernier Rect dessine pour ce mode (parafe/sig), toutes pages confondues."""
         for idx in reversed(range(len(self.pages))):
             r = self._rects.get(idx, {}).get(mode)
             if r:
@@ -575,14 +595,10 @@ class PickerCanvas(Widget):
         self._redraw()
 
     def restore_rects(self, parafe_rect, sig_rect):
-        """Reaffiche les rects deja definis (retour sur l'ecran picker)."""
-        # On les pose sur la page 0 visuellement si pas de page connue
         if parafe_rect and self.pages:
             self._rects[0]["parafe"] = parafe_rect
         if sig_rect and self.pages:
             self._rects[0]["sig"] = sig_rect
-        # Pas de coords canvas disponibles -> pas de reaffichage visuel des anciens
-        # (ils seront redefinis par l'utilisateur si besoin)
 
 
 # -------------------------------------------------------------------------
@@ -598,7 +614,6 @@ class PickerScreen(Screen):
     def _build_ui(self):
         root = BoxLayout(orientation="vertical", spacing=0)
 
-        # -- Barre de boutons --
         bar = BoxLayout(orientation="horizontal", size_hint_y=None, height=H_BTN,
                         spacing=4, padding=(4, 4))
         with bar.canvas.before:
@@ -615,19 +630,16 @@ class PickerScreen(Screen):
                              on_press=lambda _: self._clear())
         btn_ok    = make_btn("OK",      bg=C_GREEN, fg=C_WHITE, size_hint_x=0.25,
                              on_press=lambda _: self._validate())
-
         for w in (self.btn_parafe, self.btn_sig, btn_clear, btn_ok):
             bar.add_widget(w)
         root.add_widget(bar)
 
-        # -- Label statut --
         self.status_lbl = make_label(
             "Choisir un mode, puis glisser pour delimiter la zone",
             color=(0.3, 0.3, 0.3, 1), height=H_LABEL, halign="center"
         )
         root.add_widget(self.status_lbl)
 
-        # -- ScrollView contenant le PickerCanvas --
         self.scroll = ScrollView(
             size_hint=(1, 1),
             do_scroll_x=False,
@@ -635,18 +647,17 @@ class PickerScreen(Screen):
             scroll_type=["bars", "content"],
         )
         self.picker = PickerCanvas(size_hint=(1, None))
-        # Le canvas se redimensionne automatiquement via _update_height
         self.scroll.add_widget(self.picker)
         root.add_widget(self.scroll)
-
         self.add_widget(root)
 
     def _set_mode(self, mode):
         self.picker.mode = mode
-        if mode == "parafe":
-            self.status_lbl.text = "Mode PARAFE — glisser sur la page souhaitee"
-        else:
-            self.status_lbl.text = "Mode SIGNATURE — glisser sur la page souhaitee"
+        self.status_lbl.text = (
+            "Mode PARAFE - glisser sur la page souhaitee"
+            if mode == "parafe" else
+            "Mode SIGNATURE - glisser sur la page souhaitee"
+        )
 
     def _clear(self):
         self.picker.clear_rects()
@@ -675,10 +686,8 @@ class PickerScreen(Screen):
                     app = App.get_running_app()
                     self.picker.restore_rects(app.parafe_rect, app.sig_rect)
                     n = len(pages)
-                    self.status_lbl.text = (
-                        "{} page{} — choisir un mode puis glisser".format(
-                            n, "s" if n > 1 else "")
-                    )
+                    self.status_lbl.text = "{} page{} - choisir un mode puis glisser".format(
+                        n, "s" if n > 1 else "")
                 Clock.schedule_once(_done)
             except Exception as exc:
                 Clock.schedule_once(
@@ -1088,7 +1097,6 @@ class MainScreen(Screen):
                 Clock.schedule_once(
                     lambda dt, n=page_num, t=total: self._prog("Page {}/{}...".format(n, t))
                 )
-
                 page_img = ensure_white_bg(page_img)
                 page_img = page_img.convert("RGBA")
 
