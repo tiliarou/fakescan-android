@@ -34,8 +34,13 @@ build.log
 Thumbs.db
 desktop.ini
 
-# ── Éditeurs ────────────────────────────────────────────────────────────────
+# ── Editeurs ────────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
+
+# ── Signature Android (ne jamais commiter) ──────────────────────────────────
+*.keystore
+*.jks
+*.p12
