@@ -264,6 +264,7 @@ def _android_pdf_page_to_pil(pdf_path, page_index=0, dpi=DPI_PREVIEW):
     File                 = autoclass("java.io.File")
     ParcelFileDescriptor = autoclass("android.os.ParcelFileDescriptor")
     PdfRenderer          = autoclass("android.graphics.pdf.PdfRenderer")
+    PdfRendererPage      = autoclass("android.graphics.pdf.PdfRenderer$Page")
     Bitmap               = autoclass("android.graphics.Bitmap")
     BitmapConfig         = autoclass("android.graphics.Bitmap$Config")
     BitmapCompressFormat = autoclass("android.graphics.Bitmap$CompressFormat")
@@ -276,7 +277,7 @@ def _android_pdf_page_to_pil(pdf_path, page_index=0, dpi=DPI_PREVIEW):
     width    = int(page.getWidth()  * scale)
     height   = int(page.getHeight() * scale)
     bitmap   = Bitmap.createBitmap(width, height, BitmapConfig.ARGB_8888)
-    page.render(bitmap, None, None, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+    page.render(bitmap, None, None, PdfRendererPage.RENDER_MODE_FOR_DISPLAY)
     page.close()
     renderer.close()
     pfd.close()
@@ -380,6 +381,8 @@ class PickerCanvas(Widget):
         self.rect_sig    = None
         self._drag_start  = None
         self._live_coords = None
+        self._offset_x    = 0
+        self._offset_y    = 0
         self.bind(size=self._redraw, pos=self._redraw)
 
     def set_preview(self, pil_img):
