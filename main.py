@@ -100,8 +100,29 @@ C_WHITE     = (1, 1, 1, 1)
 C_TEXT_DARK = (0.15, 0.15, 0.15, 1)
 
 
+from kivy.metrics import dp, sp as _sp
+
+# Polices (sp : respecte la preference utilisateur de taille de texte)
+FS_BTN     = "16sp"   # boutons
+FS_LABEL   = "15sp"   # labels courants
+FS_SECTION = "17sp"   # titres de section
+FS_INPUT   = "16sp"   # champs de saisie
+FS_HEADER  = "20sp"   # titre app
+FS_POPUP   = "15sp"   # toasts / popups
+
+# Hauteurs (dp : independant de la densite, equivalent aux dp Android natifs)
+H_BTN      = dp(48)   # touch target minimum recommande par Material Design
+H_LABEL    = dp(36)
+H_SECTION  = dp(40)
+H_INPUT    = dp(48)
+H_HEADER   = dp(56)   # toolbar Android standard
+H_BTN_GEN  = dp(56)   # bouton principal
+H_SLIDER   = dp(48)
+H_SPACER   = dp(16)
+
+
 def make_btn(text, bg=C_GREY_BTN, fg=C_TEXT_DARK, size_hint_x=1,
-             height=44, bold=False, on_press=None):
+             height=H_BTN, bold=False, on_press=None):
     btn = Button(
         text=text,
         background_normal="",
@@ -110,15 +131,15 @@ def make_btn(text, bg=C_GREY_BTN, fg=C_TEXT_DARK, size_hint_x=1,
         size_hint=(size_hint_x, None),
         height=height,
         bold=bold,
-        font_size="13sp",
+        font_size=FS_BTN,
     )
     if on_press:
         btn.bind(on_press=on_press)
     return btn
 
 
-def make_label(text, color=C_TEXT_DARK, font_size="12sp",
-               size_hint_y=None, height=28, halign="left", italic=False):
+def make_label(text, color=C_TEXT_DARK, font_size=FS_LABEL,
+               size_hint_y=None, height=H_LABEL, halign="left", italic=False):
     lbl = Label(
         text=text,
         color=color,
@@ -137,9 +158,9 @@ def section_label(text):
         text="[b]" + text + "[/b]",
         markup=True,
         color=C_HEADER,
-        font_size="13sp",
+        font_size=FS_SECTION,
         size_hint_y=None,
-        height=32,
+        height=H_SECTION,
         halign="left",
     )
     lbl.bind(size=lambda inst, v: setattr(inst, "text_size", v))
@@ -474,7 +495,7 @@ class PickerScreen(Screen):
     def _build_ui(self):
         root = BoxLayout(orientation="vertical", spacing=0)
 
-        bar = BoxLayout(orientation="horizontal", size_hint_y=None, height=50,
+        bar = BoxLayout(orientation="horizontal", size_hint_y=None, height=H_BTN,
                         spacing=4, padding=(4, 4))
         with bar.canvas.before:
             Color(*C_HEADER)
@@ -497,7 +518,7 @@ class PickerScreen(Screen):
 
         self.status_lbl = make_label(
             "Choisir un mode, puis glisser pour delimiter la zone",
-            color=(0.3, 0.3, 0.3, 1), height=30, halign="center"
+            color=(0.3, 0.3, 0.3, 1), height=H_LABEL, halign="center"
         )
         root.add_widget(self.status_lbl)
 
@@ -537,7 +558,95 @@ class PickerScreen(Screen):
 
 
 # -------------------------------------------------------------------------
-# WIDGET : FILE CHOOSER POPUP
+# SELECTEUR DE FICHIER NATIF ANDROID
+# -------------------------------------------------------------------------
+
+# Callback global pour recevoir le résultat de l'Intent
+_file_picker_callback = None
+
+if ANDROID:
+    from android.activity import bind as activity_bind  # type: ignore
+
+    def _on_activity_result(requestCode, resultCode, intent):
+        global _file_picker_callback
+        RESULT_OK = -1
+        if requestCode == 42 and resultCode == RESULT_OK and intent and _file_picker_callback:
+            uri  = intent.getData()
+            cb   = _file_picker_callback
+            _file_picker_callback = None
+
+            # Résoudre l'URI en chemin réel
+            try:
+                ContentResolver  = autoclass("android.content.ContentResolver")
+                PythonActivity   = autoclass("org.kivy.android.PythonActivity")
+                context          = PythonActivity.mActivity
+                resolver         = context.getContentResolver()
+
+                # Essayer d'obtenir le chemin via cursor
+                cursor = resolver.query(uri, None, None, None, None)
+                path   = None
+                if cursor and cursor.moveToFirst():
+                    try:
+                        idx  = cursor.getColumnIndex("_data")
+                        if idx >= 0:
+                            path = cursor.getString(idx)
+                    except Exception:
+                        pass
+                    cursor.close()
+
+                # Si pas de chemin direct, copier vers cache
+                if not path:
+                    import tempfile
+                    istream = resolver.openInputStream(uri)
+                    suffix  = ".pdf"
+                    try:
+                        name = uri.getLastPathSegment()
+                        if name and "." in name:
+                            suffix = "." + name.rsplit(".", 1)[-1]
+                    except Exception:
+                        pass
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+                    buf = bytearray(65536)
+                    while True:
+                        n = istream.read(buf)
+                        if n < 0:
+                            break
+                        tmp.write(bytes(buf[:n]))
+                    tmp.close()
+                    istream.close()
+                    path = tmp.name
+
+                if path:
+                    Clock.schedule_once(lambda dt: cb(path))
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+
+    activity_bind(on_activity_result=_on_activity_result)
+
+
+def open_file_picker(callback, mime_type="*/*"):
+    """Ouvre le sélecteur de fichier natif Android ou un FilePopup sur desktop."""
+    global _file_picker_callback
+    if ANDROID and HAS_JNIUS:
+        _file_picker_callback = callback
+        Intent         = autoclass("android.content.Intent")
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        intent = Intent(Intent.ACTION_GET_CONTENT)
+        intent.setType(mime_type)
+        intent.addCategory(Intent.CATEGORY_OPENABLE)
+        PythonActivity.mActivity.startActivityForResult(intent, 42)
+    else:
+        # Desktop : popup Kivy classique
+        if mime_type == "application/pdf":
+            filters = ["*.pdf"]
+        else:
+            filters = ["*.png", "*.jpg", "*.jpeg"]
+        FilePopup(callback, filters=filters).open()
+
+
+# -------------------------------------------------------------------------
+# WIDGET : FILE CHOOSER POPUP (desktop uniquement)
 # -------------------------------------------------------------------------
 
 class FilePopup(Popup):
@@ -557,7 +666,7 @@ class FilePopup(Popup):
         )
         layout.add_widget(self.chooser)
 
-        btn_row = BoxLayout(size_hint_y=None, height=44, spacing=8)
+        btn_row = BoxLayout(size_hint_y=None, height=H_BTN, spacing=8)
         btn_row.add_widget(make_btn("Annuler",      bg=C_RED,   fg=C_WHITE,
                                     on_press=lambda _: self.dismiss()))
         btn_row.add_widget(make_btn("Selectionner", bg=C_GREEN, fg=C_WHITE,
@@ -587,12 +696,12 @@ class NamedSlider(BoxLayout):
 
     def __init__(self, label, lo, hi, value, step=0.05, **kwargs):
         super().__init__(orientation="horizontal", size_hint_y=None,
-                         height=40, spacing=6, **kwargs)
-        self._lbl = make_label(label, height=40, halign="left")
+                         height=H_SLIDER, spacing=6, **kwargs)
+        self._lbl = make_label(label, height=H_SLIDER, halign="left")
         self._lbl.size_hint_x = 0.38
 
         self.slider = Slider(min=lo, max=hi, value=value, step=step, size_hint_x=0.44)
-        self._val_lbl = make_label("{:.2f}".format(value), height=40, halign="right")
+        self._val_lbl = make_label("{:.2f}".format(value), height=H_SLIDER, halign="right")
         self._val_lbl.size_hint_x = 0.18
 
         self.slider.bind(value=self._on_value)
@@ -626,14 +735,14 @@ class MainScreen(Screen):
         outer.bind(size=lambda w, v: setattr(self._bg, "size", v),
                    pos =lambda w, v: setattr(self._bg, "pos",  v))
 
-        header = BoxLayout(size_hint_y=None, height=52, padding=(12, 8))
+        header = BoxLayout(size_hint_y=None, height=H_HEADER, padding=(12, 8))
         with header.canvas.before:
             Color(*C_HEADER)
             self._hbg = Rectangle()
         header.bind(size=lambda w, v: setattr(self._hbg, "size", v),
                     pos =lambda w, v: setattr(self._hbg, "pos",  v))
         header.add_widget(Label(text="[b]Fake Scan PDF[/b]", markup=True,
-                                color=C_WHITE, font_size="16sp", halign="left"))
+                                color=C_WHITE, font_size=FS_SECTION, halign="left"))
         outer.add_widget(header)
 
         scroll  = ScrollView(size_hint=(1, 1), do_scroll_x=False)
@@ -643,50 +752,50 @@ class MainScreen(Screen):
 
         content.add_widget(section_label("Fichiers"))
 
-        row_pdf = BoxLayout(size_hint_y=None, height=44, spacing=6)
+        row_pdf = BoxLayout(size_hint_y=None, height=H_BTN, spacing=6)
         row_pdf.add_widget(make_btn("PDF", bg=(0.88, 0.96, 1, 1), size_hint_x=0.38,
                                     on_press=lambda _: self._pick_pdf()))
-        self.pdf_label = make_label("Aucun PDF", color=(0.5, 0.5, 0.5, 1), height=44)
+        self.pdf_label = make_label("Aucun PDF", color=(0.5, 0.5, 0.5, 1), height=H_BTN)
         row_pdf.add_widget(self.pdf_label)
         content.add_widget(row_pdf)
 
         self.btn_picker = make_btn("Definir les zones (parafe / signature)",
-                                   bg=C_ORANGE, fg=C_WHITE, height=44,
+                                   bg=C_ORANGE, fg=C_WHITE, height=H_BTN,
                                    on_press=lambda _: self._open_picker())
         self.btn_picker.disabled = True
         content.add_widget(self.btn_picker)
 
         self.zones_label = make_label("Zones : non definies",
-                                      color=(0.55, 0.35, 0.65, 1), height=28, italic=True)
+                                      color=(0.55, 0.35, 0.65, 1), height=H_LABEL, italic=True)
         content.add_widget(self.zones_label)
 
-        row_p = BoxLayout(size_hint_y=None, height=44, spacing=6)
+        row_p = BoxLayout(size_hint_y=None, height=H_BTN, spacing=6)
         row_p.add_widget(make_btn("Parafe", bg=(0.96, 0.90, 1.00, 1), size_hint_x=0.38,
                                    on_press=lambda _: self._pick_parafe()))
-        self.parafe_label = make_label("Aucune image", color=(0.5, 0.5, 0.5, 1), height=44)
+        self.parafe_label = make_label("Aucune image", color=(0.5, 0.5, 0.5, 1), height=H_BTN)
         row_p.add_widget(self.parafe_label)
         content.add_widget(row_p)
 
-        row_s = BoxLayout(size_hint_y=None, height=44, spacing=6)
+        row_s = BoxLayout(size_hint_y=None, height=H_BTN, spacing=6)
         row_s.add_widget(make_btn("Signature", bg=(0.90, 0.97, 0.90, 1), size_hint_x=0.38,
                                    on_press=lambda _: self._pick_sig()))
-        self.sig_label = make_label("Aucune image", color=(0.5, 0.5, 0.5, 1), height=44)
+        self.sig_label = make_label("Aucune image", color=(0.5, 0.5, 0.5, 1), height=H_BTN)
         row_s.add_widget(self.sig_label)
         content.add_widget(row_s)
 
         content.add_widget(section_label("Pages  (ex : 1  ou  1,3-5,7)"))
 
-        row_pp = BoxLayout(size_hint_y=None, height=40, spacing=6)
-        row_pp.add_widget(make_label("Parafe :", height=40, halign="left"))
+        row_pp = BoxLayout(size_hint_y=None, height=H_INPUT, spacing=6)
+        row_pp.add_widget(make_label("Parafe :", height=H_INPUT, halign="left"))
         self.parafe_pages = TextInput(text="1", multiline=False,
-                                      size_hint_y=None, height=40, font_size="14sp")
+                                      size_hint_y=None, height=H_INPUT, font_size=FS_INPUT)
         row_pp.add_widget(self.parafe_pages)
         content.add_widget(row_pp)
 
-        row_sp = BoxLayout(size_hint_y=None, height=40, spacing=6)
-        row_sp.add_widget(make_label("Signature :", height=40, halign="left"))
+        row_sp = BoxLayout(size_hint_y=None, height=H_INPUT, spacing=6)
+        row_sp.add_widget(make_label("Signature :", height=H_INPUT, halign="left"))
         self.sig_pages = TextInput(text="1", multiline=False,
-                                   size_hint_y=None, height=40, font_size="14sp")
+                                   size_hint_y=None, height=H_INPUT, font_size=FS_INPUT)
         row_sp.add_widget(self.sig_pages)
         content.add_widget(row_sp)
 
@@ -700,21 +809,21 @@ class MainScreen(Screen):
             content.add_widget(w)
 
         self.btn_gen = make_btn("GENERER PDF SCAN", bg=C_GREEN, fg=C_WHITE,
-                                height=56, bold=True, on_press=lambda _: self._run())
+                                height=H_BTN_GEN, bold=True, on_press=lambda _: self._run())
         content.add_widget(self.btn_gen)
 
         self.progress_lbl = make_label("", color=(0.4, 0.4, 0.4, 1),
-                                       height=28, halign="center", italic=True)
+                                       height=H_LABEL, halign="center", italic=True)
         content.add_widget(self.progress_lbl)
 
-        content.add_widget(Widget(size_hint_y=None, height=20))
+        content.add_widget(Widget(size_hint_y=None, height=H_SPACER))
 
         scroll.add_widget(content)
         outer.add_widget(scroll)
         self.add_widget(outer)
 
     def _pick_pdf(self):
-        FilePopup(self._on_pdf_selected, filters=["*.pdf"]).open()
+        open_file_picker(self._on_pdf_selected, mime_type="application/pdf")
 
     def _on_pdf_selected(self, path):
         app = App.get_running_app()
@@ -731,7 +840,7 @@ class MainScreen(Screen):
         self.refresh_zones_label()
 
     def _pick_parafe(self):
-        FilePopup(self._on_parafe_selected, filters=["*.png", "*.jpg", "*.jpeg"]).open()
+        open_file_picker(self._on_parafe_selected, mime_type="image/*")
 
     def _on_parafe_selected(self, path):
         App.get_running_app().parafe_path = path
@@ -739,7 +848,7 @@ class MainScreen(Screen):
         self.parafe_label.color = (0.30, 0.05, 0.40, 1)
 
     def _pick_sig(self):
-        FilePopup(self._on_sig_selected, filters=["*.png", "*.jpg", "*.jpeg"]).open()
+        open_file_picker(self._on_sig_selected, mime_type="image/*")
 
     def _on_sig_selected(self, path):
         App.get_running_app().sig_path = path
@@ -855,7 +964,7 @@ class MainScreen(Screen):
         self._reset_btn()
         Popup(
             title="Erreur",
-            content=Label(text=err, font_size="10sp",
+            content=Label(text=err, font_size=FS_POPUP,
                           text_size=(Window.width * 0.85, None)),
             size_hint=(0.9, 0.7)
         ).open()
@@ -871,8 +980,8 @@ class MainScreen(Screen):
     def _toast(self, msg, duration=2.5):
         pop = Popup(
             title="",
-            content=Label(text=msg, halign="center", font_size="13sp"),
-            size_hint=(0.8, None), height=120,
+            content=Label(text=msg, halign="center", font_size=FS_POPUP),
+            size_hint=(0.8, None), height=H_BTN * 2,
             auto_dismiss=True,
             separator_height=0,
         )
@@ -897,12 +1006,12 @@ class FakeScanApp(App):
         if ANDROID and not HAS_JNIUS:
             return Label(
                 text="[b]Erreur :[/b]\nJnius non disponible.",
-                markup=True, halign="center", font_size="14sp"
+                markup=True, halign="center", font_size=FS_POPUP
             )
         if not ANDROID and not HAS_FITZ:
             return Label(
                 text="[b]Erreur :[/b]\nPyMuPDF non installe.\n\npip install pymupdf",
-                markup=True, halign="center", font_size="14sp"
+                markup=True, halign="center", font_size=FS_POPUP
             )
 
         self.sm = ScreenManager()
