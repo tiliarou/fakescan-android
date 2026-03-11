@@ -18,22 +18,35 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Decode keystore from secret
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+        run: |
+          echo "$KEYSTORE_B64" | base64 -d > ${{ github.workspace }}/fakescan.keystore
+
       - name: Cache buildozer
         uses: actions/cache@v4
         with:
           path: .buildozer
           key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
           restore-keys: buildozer-${{ runner.os }}-
-      
-      - name: Build APK via kivy/buildozer Docker image
+
+      - name: Inject keystore passwords into buildozer.spec
+        env:
+          KEYSTORE_PASSWD: ${{ secrets.KEYSTORE_PASSWD }}
+          KEYALIAS_PASSWD: ${{ secrets.KEYALIAS_PASSWD }}
+        run: |
+          sed -i "s|YOUR_PASSWORD|$KEYSTORE_PASSWD|g" buildozer.spec
+
+      - name: Build Release APK via kivy/buildozer Docker image
         run: |
           docker run --rm \
             --entrypoint /bin/sh \
             -v ${{ github.workspace }}:/home/user/hostcwd \
             -e HOME=/home/user/hostcwd \
             ghcr.io/kivy/buildozer:latest \
-            -c "git config --global --add safe.directory '*' && yes | /home/user/.venv/bin/python -m buildozer android debug"
-            
+            -c "git config --global --add safe.directory '*' && yes | /home/user/.venv/bin/python -m buildozer android release"
+
       - name: Find APK
         run: |
           APK=$(find ${{ github.workspace }}/bin -name "*.apk" | head -1)
@@ -43,7 +56,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: fakescan-debug-apk
+          name: fakescan-release-apk
           path: bin/*.apk
           retention-days: 30
 
@@ -60,7 +73,7 @@ jobs:
       - name: Download APK
         uses: actions/download-artifact@v4
         with:
-          name: fakescan-debug-apk
+          name: fakescan-release-apk
           path: bin/
 
       - name: Create Release
