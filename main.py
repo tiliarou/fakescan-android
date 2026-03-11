@@ -65,6 +65,16 @@ else:
 # TRAITEMENT IMAGE PIL PUR
 # -------------------------------------------------------------------------
 
+def ensure_white_bg(img):
+    """Si l'image a un canal alpha (RGBA/LA), composite sur fond blanc.
+    Evite le fond noir sur les PDF formulaires avec zones transparentes."""
+    if img.mode in ("RGBA", "LA"):
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img, mask=img.split()[-1])  # split()[-1] = canal alpha
+        return bg
+    return img.convert("RGB")
+
+
 def _pil_grain_L(img, strength=4):
     """Bruit grain sur image en niveaux de gris (mode L) - PIL pur, sans numpy."""
     w, h = img.size
@@ -280,6 +290,8 @@ def _android_pdf_page_to_pil(pdf_path, page_index=0, dpi=DPI_PREVIEW):
     BitmapConfig         = autoclass("android.graphics.Bitmap$Config")
     BitmapCompressFormat = autoclass("android.graphics.Bitmap$CompressFormat")
     ByteArrayOS          = autoclass("java.io.ByteArrayOutputStream")
+    Color_java           = autoclass("android.graphics.Color")
+    Canvas_java          = autoclass("android.graphics.Canvas")
 
     pfd      = ParcelFileDescriptor.open(File(pdf_path), ParcelFileDescriptor.MODE_READ_ONLY)
     renderer = PdfRenderer(pfd)
@@ -287,14 +299,22 @@ def _android_pdf_page_to_pil(pdf_path, page_index=0, dpi=DPI_PREVIEW):
     scale    = dpi / 72.0
     width    = int(page.getWidth()  * scale)
     height   = int(page.getHeight() * scale)
-    bitmap   = Bitmap.createBitmap(width, height, BitmapConfig.ARGB_8888)
+
+    # Creer un bitmap blanc opaque (ARGB_8888) et y dessiner un fond blanc
+    # avant le rendu PDF, pour eviter le fond noir sur les formulaires transparents
+    bitmap = Bitmap.createBitmap(width, height, BitmapConfig.ARGB_8888)
+    canvas = Canvas_java(bitmap)
+    canvas.drawColor(Color_java.WHITE)
+
     page.render(bitmap, None, None, PdfRendererPage.RENDER_MODE_FOR_DISPLAY)
     page.close()
     renderer.close()
     pfd.close()
     baos = ByteArrayOS()
     bitmap.compress(BitmapCompressFormat.PNG, 100, baos)
-    return Image.open(io.BytesIO(bytes(baos.toByteArray())))
+    img = Image.open(io.BytesIO(bytes(baos.toByteArray())))
+    # Securite supplementaire : aplatir RGBA sur blanc si encore present
+    return ensure_white_bg(img)
 
 
 def _android_pdf_page_count(pdf_path):
@@ -481,7 +501,6 @@ class PickerCanvas(Widget):
         else:
             ry0_f, ry1_f = ry0, ry1
         rect = Rect(rx0, ry0_f, rx1, ry1_f)
-        # FIX: etait max(x0, y1) / max(y0, y1) -> typo corrigee en max(x0, x1) / max(y0, y1)
         if self.mode == "parafe":
             self.rect_parafe         = rect
             self._rect_parafe_canvas = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
@@ -904,8 +923,6 @@ class MainScreen(Screen):
         app.pdf_path    = path
         app.parafe_rect = None
         app.sig_rect    = None
-        # Sur Android, pdf_display_name a deja ete renseigne par _on_activity_result
-        # avant l'appel de ce callback - ne pas l'ecraser avec le nom du fichier tmp
         if not app.pdf_display_name:
             app.pdf_display_name = os.path.basename(path)
         self.pdf_label.text  = app.pdf_display_name
@@ -921,7 +938,6 @@ class MainScreen(Screen):
         open_file_picker(self._on_parafe_selected, mime_type="image/*")
 
     def _on_parafe_selected(self, path):
-        # FIX: ne pas toucher a pdf_display_name ici
         App.get_running_app().parafe_path = path
         self.parafe_label.text  = os.path.basename(path)
         self.parafe_label.color = (0.30, 0.05, 0.40, 1)
@@ -930,7 +946,6 @@ class MainScreen(Screen):
         open_file_picker(self._on_sig_selected, mime_type="image/*")
 
     def _on_sig_selected(self, path):
-        # FIX: ne pas toucher a pdf_display_name ici
         App.get_running_app().sig_path = path
         self.sig_label.text  = os.path.basename(path)
         self.sig_label.color = (0.05, 0.35, 0.05, 1)
@@ -1006,6 +1021,9 @@ class MainScreen(Screen):
                 Clock.schedule_once(
                     lambda dt, n=page_num, t=total: self._prog("Page {}/{}...".format(n, t))
                 )
+
+                # -- FIX : aplatir transparence sur fond blanc AVANT tout traitement --
+                page_img = ensure_white_bg(page_img)
                 page_img = page_img.convert("RGBA")
 
                 if parafe_base and page_num in p["parafe_pages"] and p["parafe_rect"]:
@@ -1031,8 +1049,6 @@ class MainScreen(Screen):
             Clock.schedule_once(lambda dt: self._prog("Encodage PDF..."))
 
             if ANDROID and HAS_JNIUS:
-                # Ecrire directement dans MediaStore Downloads
-                # -> retourne un content:// URI utilisable directement pour ouvrir
                 try:
                     ContentValues  = autoclass("android.content.ContentValues")
                     Downloads      = autoclass("android.provider.MediaStore$Downloads")
@@ -1045,7 +1061,6 @@ class MainScreen(Screen):
                     values.put("mime_type",     "application/pdf")
                     values.put("relative_path", "Download/")
 
-                    # Supprimer l'entree existante si meme nom
                     try:
                         resolver.delete(
                             Downloads.EXTERNAL_CONTENT_URI,
@@ -1069,7 +1084,6 @@ class MainScreen(Screen):
                             self._on_done(n, u))
 
                 except Exception:
-                    # Fallback : ecrire sur disque
                     import traceback; traceback.print_exc()
                     Environment = autoclass("android.os.Environment")
                     out_dir  = Environment.getExternalStoragePublicDirectory(
@@ -1120,7 +1134,6 @@ class MainScreen(Screen):
                     intent.setDataAndType(uri, "application/pdf")
                     intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                     intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    # FIX: caster le titre en java.lang.String pour eviter l'erreur Pyjnius
                     ctx.startActivity(
                         Intent.createChooser(intent, JavaString("Ouvrir avec")))
                 except Exception as exc:
