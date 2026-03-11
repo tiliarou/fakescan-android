@@ -18,6 +18,7 @@ import os
 import random
 import threading
 import sys
+import tempfile
 
 # -- Kivy config (avant tout import kivy) ----------------------------------
 from kivy.config import Config
@@ -51,8 +52,8 @@ if ANDROID:
         HAS_JNIUS = True
 
         # -- Toutes les classes Java chargees UNE SEULE FOIS au demarrage --
-        _PythonActivity      = autoclass("org.kivy.android.PythonActivity")
-        _Uri                 = autoclass("android.net.Uri")
+        _PythonActivity       = autoclass("org.kivy.android.PythonActivity")
+        _Uri                  = autoclass("android.net.Uri")
         _ParcelFileDescriptor = autoclass("android.os.ParcelFileDescriptor")
         _PdfRenderer          = autoclass("android.graphics.pdf.PdfRenderer")
         _PdfRendererPage      = autoclass("android.graphics.pdf.PdfRenderer$Page")
@@ -67,6 +68,7 @@ if ANDROID:
         _Downloads            = autoclass("android.provider.MediaStore$Downloads")
         _JavaString           = autoclass("java.lang.String")
         _Environment          = autoclass("android.os.Environment")
+        _File                 = autoclass("java.io.File")
 
     except ImportError:
         HAS_JNIUS = False
@@ -294,17 +296,47 @@ DPI_PREVIEW = 100
 DPI_PROCESS = 250
 
 
-def _android_open_renderer_from_uri(uri_string):
+def _android_get_cache_dir():
+    """Retourne le repertoire cache prive de l'app (toujours accessible en R/W)."""
+    return _PythonActivity.mActivity.getCacheDir().getAbsolutePath()
+
+
+def _android_uri_to_seekable_file(uri_string, suffix=".pdf"):
     """
-    Ouvre un PdfRenderer directement depuis un URI ContentResolver.
-    C'est la SEULE facon fiable sur Android 10+ : on ne passe jamais
-    par un chemin fichier, ce qui evite l'erreur errno 63 (ENODATA).
-    Retourne (renderer, pfd). A fermer apres usage.
+    Copie le contenu d'un URI ContentResolver dans un fichier temp
+    situe dans le CacheDir de l'app (seekable, accessible par PdfRenderer).
+    Retourne le chemin du fichier temp.
     """
     context  = _PythonActivity.mActivity
     resolver = context.getContentResolver()
     uri      = _Uri.parse(uri_string)
-    pfd      = resolver.openFileDescriptor(uri, "r")
+    istream  = resolver.openInputStream(uri)
+
+    cache_dir = _android_get_cache_dir()
+    tmp = tempfile.NamedTemporaryFile(
+        delete=False, suffix=suffix, dir=cache_dir
+    )
+    buf = bytearray(65536)
+    while True:
+        n = istream.read(buf)
+        if n < 0:
+            break
+        tmp.write(bytes(buf[:n]))
+    tmp.flush()
+    os.fsync(tmp.fileno())   # garantit que tout est ecrit sur disque
+    tmp.close()
+    istream.close()
+    return tmp.name
+
+
+def _android_open_renderer_from_path(path):
+    """
+    Ouvre un PdfRenderer depuis un chemin fichier local (seekable garanti).
+    Retourne (renderer, pfd).
+    """
+    pfd      = _ParcelFileDescriptor.open(
+        _File(path), _ParcelFileDescriptor.MODE_READ_ONLY
+    )
     renderer = _PdfRenderer(pfd)
     return renderer, pfd
 
@@ -333,10 +365,13 @@ def _android_render_page(renderer, page_index, dpi):
 
 def _android_pdf_all_pages_uri(uri_string, dpi):
     """
-    Rend toutes les pages d'un PDF identifie par son URI ContentResolver.
-    Ouvre le renderer UNE SEULE FOIS pour toutes les pages.
+    Rend toutes les pages d'un PDF identifie par son URI.
+    Copie d'abord dans un fichier CacheDir seekable, puis ouvre
+    le PdfRenderer une seule fois pour toutes les pages.
+    Supprime le fichier temp a la fin.
     """
-    renderer, pfd = _android_open_renderer_from_uri(uri_string)
+    tmp_path = _android_uri_to_seekable_file(uri_string, suffix=".pdf")
+    renderer, pfd = _android_open_renderer_from_path(tmp_path)
     images = []
     try:
         count = renderer.getPageCount()
@@ -345,21 +380,27 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
     finally:
         renderer.close()
         pfd.close()
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
     return images
 
 
 def _android_pdf_page_count_uri(uri_string):
-    renderer, pfd = _android_open_renderer_from_uri(uri_string)
+    tmp_path = _android_uri_to_seekable_file(uri_string, suffix=".pdf")
+    renderer, pfd = _android_open_renderer_from_path(tmp_path)
     count = renderer.getPageCount()
     renderer.close()
     pfd.close()
+    try:
+        os.unlink(tmp_path)
+    except Exception:
+        pass
     return count
 
 
 def pdf_page_count(pdf_source):
-    """
-    pdf_source : URI string sur Android, chemin fichier sinon.
-    """
     if ANDROID and HAS_JNIUS:
         return _android_pdf_page_count_uri(pdf_source)
     elif HAS_FITZ:
@@ -371,7 +412,6 @@ def pdf_page_count(pdf_source):
 
 
 def pdf_to_pil_list(pdf_source, dpi=DPI_PROCESS):
-    """Rend toutes les pages a haute resolution (generation finale)."""
     if ANDROID and HAS_JNIUS:
         return _android_pdf_all_pages_uri(pdf_source, dpi)
     elif HAS_FITZ:
@@ -387,7 +427,6 @@ def pdf_to_pil_list(pdf_source, dpi=DPI_PROCESS):
 
 
 def pdf_preview_all_pages(pdf_source, dpi=DPI_PREVIEW):
-    """Rend toutes les pages a basse resolution pour la previsualisation."""
     if ANDROID and HAS_JNIUS:
         return _android_pdf_all_pages_uri(pdf_source, dpi)
     elif HAS_FITZ:
@@ -428,7 +467,7 @@ def pil_to_kivy_texture(pil_img):
 def open_image_from_source(source):
     """
     Ouvre une image PIL depuis un URI ContentResolver (Android)
-    ou depuis un chemin fichier (desktop / fichier temp image).
+    ou depuis un chemin fichier (desktop).
     """
     if ANDROID and HAS_JNIUS and source.startswith("content://"):
         context  = _PythonActivity.mActivity
@@ -685,7 +724,6 @@ class PickerScreen(Screen):
         app.main_screen.refresh_zones_label()
 
     def load_pdf_preview(self, pdf_source):
-        """Charge toutes les pages en thread pour ne pas bloquer l'UI."""
         self.status_lbl.text = "Chargement des pages..."
         self.picker.pages = []
         self.picker.canvas.clear()
@@ -736,7 +774,6 @@ if ANDROID:
             uri_string = uri.toString()
 
             try:
-                # Recuperer le nom d'affichage via le curseur
                 context  = _PythonActivity.mActivity
                 resolver = context.getContentResolver()
                 display_name = None
@@ -755,12 +792,9 @@ if ANDROID:
                     except Exception:
                         display_name = "fichier"
 
-                if is_pdf:
+                if is_pdf and display_name:
                     App.get_running_app().pdf_display_name = display_name
 
-                # Pour les images (parafe/signature), on copie encore dans un temp
-                # car PIL ne sait pas lire depuis un InputStream Java directement
-                # (on passe par open_image_from_source qui lit l'URI)
                 Clock.schedule_once(lambda dt: cb(uri_string))
 
             except Exception:
@@ -987,7 +1021,7 @@ class MainScreen(Screen):
 
     def _on_pdf_selected(self, source):
         app = App.get_running_app()
-        app.pdf_path    = source   # URI string sur Android, chemin sur desktop
+        app.pdf_path    = source
         app.parafe_rect = None
         app.sig_rect    = None
         if not app.pdf_display_name:
@@ -1112,7 +1146,6 @@ class MainScreen(Screen):
                 out_images.append(page_img.convert("RGB"))
 
             out_filename = os.path.splitext(p["pdf_name"])[0] + "_scan.pdf"
-            # Supprimer l'extension double eventuelle (.pdf_scan.pdf -> _scan.pdf)
             if out_filename.endswith(".pdf_scan.pdf"):
                 out_filename = out_filename[:-len(".pdf_scan.pdf")] + "_scan.pdf"
             Clock.schedule_once(lambda dt: self._prog("Encodage PDF..."))
@@ -1149,7 +1182,7 @@ class MainScreen(Screen):
                     Clock.schedule_once(
                         lambda dt, n=out_filename, u=None: self._on_done(n, u))
             else:
-                base = p["pdf_path"] if not p["pdf_path"].startswith("content://") else "/tmp"
+                base     = p["pdf_path"] if not p["pdf_path"].startswith("content://") else "/tmp"
                 out_path = os.path.join(os.path.dirname(base), out_filename)
                 pil_list_to_pdf(out_images, out_path)
                 Clock.schedule_once(
