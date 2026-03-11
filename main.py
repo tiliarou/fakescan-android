@@ -946,12 +946,36 @@ class MainScreen(Screen):
                 )
                 out_images.append(page_img.convert("RGB"))
 
-            base     = os.path.splitext(os.path.basename(p["pdf_path"]))[0]
-            out_dir  = os.path.dirname(p["pdf_path"])
+            base = os.path.splitext(os.path.basename(p["pdf_path"]))[0]
+
+            # Dossier de sortie garanti en écriture
+            if ANDROID and HAS_JNIUS:
+                Environment = autoclass("android.os.Environment")
+                dl_dir = Environment.getExternalStoragePublicDirectory(
+                    Environment.DIRECTORY_DOWNLOADS
+                )
+                out_dir = dl_dir.getAbsolutePath()
+            else:
+                out_dir = os.path.dirname(p["pdf_path"])
+
             out_path = os.path.join(out_dir, base + "_scan.pdf")
 
             Clock.schedule_once(lambda dt: self._prog("Encodage PDF..."))
             pil_list_to_pdf(out_images, out_path)
+
+            # Notifier MediaStore pour que le fichier soit visible partout
+            if ANDROID and HAS_JNIUS:
+                try:
+                    MediaScannerConnection = autoclass(
+                        "android.media.MediaScannerConnection")
+                    PythonActivity = autoclass("org.kivy.android.PythonActivity")
+                    MediaScannerConnection.scanFile(
+                        PythonActivity.mActivity,
+                        [out_path], ["application/pdf"], None
+                    )
+                except Exception:
+                    pass
+
             Clock.schedule_once(lambda dt, o=out_path: self._on_done(o))
 
         except Exception as exc:
@@ -961,7 +985,53 @@ class MainScreen(Screen):
 
     def _on_done(self, out_path):
         self._reset_btn()
-        self._toast("PDF genere :\n" + os.path.basename(out_path), duration=4)
+        # Popup avec chemin + bouton Ouvrir
+        content = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(12))
+        content.add_widget(Label(
+            text="PDF genere :\n" + out_path,
+            font_size=FS_POPUP, halign="center",
+            text_size=(Window.width * 0.75, None),
+            size_hint_y=None, height=dp(80),
+        ))
+        btn_row = BoxLayout(size_hint_y=None, height=H_BTN, spacing=dp(8))
+
+        popup = Popup(
+            title="Termine",
+            content=content,
+            size_hint=(0.88, None),
+            height=dp(220),
+        )
+
+        def _open_pdf(_):
+            popup.dismiss()
+            if ANDROID and HAS_JNIUS:
+                try:
+                    Intent        = autoclass("android.content.Intent")
+                    Uri           = autoclass("android.net.Uri")
+                    File          = autoclass("java.io.File")
+                    FileProvider  = autoclass(
+                        "androidx.core.content.FileProvider")
+                    PythonActivity = autoclass("org.kivy.android.PythonActivity")
+                    ctx     = PythonActivity.mActivity
+                    pkg     = ctx.getPackageName()
+                    f       = File(out_path)
+                    uri     = FileProvider.getUriForFile(
+                        ctx, pkg + ".fileprovider", f)
+                    intent  = Intent(Intent.ACTION_VIEW)
+                    intent.setDataAndType(uri, "application/pdf")
+                    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    ctx.startActivity(intent)
+                except Exception as exc:
+                    self._toast("Ouvrir avec :\n" + out_path, duration=6)
+
+        btn_open  = make_btn("Ouvrir le PDF",  bg=C_GREEN,    fg=C_WHITE,
+                             on_press=_open_pdf)
+        btn_close = make_btn("Fermer",         bg=C_GREY_BTN, fg=C_TEXT_DARK,
+                             on_press=lambda _: popup.dismiss())
+        btn_row.add_widget(btn_open)
+        btn_row.add_widget(btn_close)
+        content.add_widget(btn_row)
+        popup.open()
 
     def _on_error(self, err):
         self._reset_btn()
