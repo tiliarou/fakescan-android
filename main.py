@@ -350,11 +350,13 @@ def pdf_to_pil_list(pdf_path, dpi=DPI_PROCESS):
     raise RuntimeError("Aucun moteur PDF disponible")
 
 
-def pil_list_to_pdf(images, out_path):
+def pil_list_to_pdf(images, out):
+    """Sauvegarde en PDF. out = chemin (str) ou objet BytesIO."""
     if not images:
         return
     rgb = [img.convert("RGB") for img in images]
-    rgb[0].save(out_path, save_all=True, append_images=rgb[1:], resolution=DPI_PROCESS)
+    rgb[0].save(out, format="PDF", save_all=True,
+                append_images=rgb[1:], resolution=DPI_PROCESS)
 
 
 def pil_to_kivy_texture(pil_img):
@@ -876,6 +878,7 @@ class MainScreen(Screen):
         self.add_widget(outer)
 
     def _pick_pdf(self):
+        App.get_running_app().pdf_display_name = None
         open_file_picker(self._on_pdf_selected, mime_type="application/pdf")
 
     def _on_pdf_selected(self, path):
@@ -883,11 +886,11 @@ class MainScreen(Screen):
         app.pdf_path    = path
         app.parafe_rect = None
         app.sig_rect    = None
-        # Récupérer le vrai nom depuis l'URI si dispo, sinon basename du path
-        display_name = os.path.basename(path)
-        # Sur Android le path peut être un tmp genre tmpXXXX.pdf — on garde le nom affiché
-        app.pdf_display_name = display_name
-        self.pdf_label.text  = display_name
+        # Sur Android, pdf_display_name a déjà été renseigné par _on_activity_result
+        # avant l'appel de ce callback — ne pas l'écraser avec le nom du fichier tmp
+        if not app.pdf_display_name:
+            app.pdf_display_name = os.path.basename(path)
+        self.pdf_label.text  = app.pdf_display_name
         self.pdf_label.color = (0.10, 0.14, 0.55, 1)
         self.btn_picker.disabled = False
         try:
@@ -1003,87 +1006,109 @@ class MainScreen(Screen):
                 )
                 out_images.append(page_img.convert("RGB"))
 
-            base = os.path.splitext(p["pdf_name"])[0]
-
-            # Dossier de sortie garanti en écriture
-            if ANDROID and HAS_JNIUS:
-                Environment = autoclass("android.os.Environment")
-                dl_dir = Environment.getExternalStoragePublicDirectory(
-                    Environment.DIRECTORY_DOWNLOADS
-                )
-                out_dir = dl_dir.getAbsolutePath()
-            else:
-                out_dir = os.path.dirname(p["pdf_path"])
-
-            out_path = os.path.join(out_dir, base + "_scan.pdf")
+            out_filename = os.path.splitext(p["pdf_name"])[0] + "_scan.pdf"
 
             Clock.schedule_once(lambda dt: self._prog("Encodage PDF..."))
-            pil_list_to_pdf(out_images, out_path)
 
-            # Notifier MediaStore pour que le fichier soit visible partout
             if ANDROID and HAS_JNIUS:
+                # Écrire directement dans MediaStore Downloads
+                # → retourne un content:// URI utilisable directement pour ouvrir
                 try:
-                    MediaScannerConnection = autoclass(
-                        "android.media.MediaScannerConnection")
+                    ContentValues  = autoclass("android.content.ContentValues")
+                    MediaStore     = autoclass("android.provider.MediaStore")
                     PythonActivity = autoclass("org.kivy.android.PythonActivity")
-                    MediaScannerConnection.scanFile(
-                        PythonActivity.mActivity,
-                        [out_path], ["application/pdf"], None
-                    )
-                except Exception:
-                    pass
+                    context        = PythonActivity.mActivity
+                    resolver       = context.getContentResolver()
 
-            Clock.schedule_once(lambda dt, o=out_path: self._on_done(o))
+                    values = ContentValues()
+                    values.put("_display_name", out_filename)
+                    values.put("mime_type",     "application/pdf")
+                    values.put("relative_path", "Download/")
+
+                    # Supprimer l'entrée existante si même nom
+                    try:
+                        resolver.delete(
+                            MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                            "_display_name=?", [out_filename]
+                        )
+                    except Exception:
+                        pass
+
+                    item_uri = resolver.insert(
+                        MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+
+                    ostream = resolver.openOutputStream(item_uri)
+                    buf = io.BytesIO()
+                    pil_list_to_pdf(out_images, buf)
+                    ostream.write(buf.getvalue())
+                    ostream.close()
+
+                    content_uri_str = item_uri.toString()
+                    Clock.schedule_once(
+                        lambda dt, n=out_filename, u=content_uri_str:
+                            self._on_done(n, u))
+
+                except Exception:
+                    # Fallback : écrire sur disque
+                    import traceback; traceback.print_exc()
+                    Environment = autoclass("android.os.Environment")
+                    out_dir  = Environment.getExternalStoragePublicDirectory(
+                        Environment.DIRECTORY_DOWNLOADS).getAbsolutePath()
+                    out_path = os.path.join(out_dir, out_filename)
+                    pil_list_to_pdf(out_images, out_path)
+                    Clock.schedule_once(
+                        lambda dt, n=out_filename, u=None: self._on_done(n, u))
+            else:
+                out_path = os.path.join(os.path.dirname(p["pdf_path"]), out_filename)
+                pil_list_to_pdf(out_images, out_path)
+                Clock.schedule_once(
+                    lambda dt, n=out_filename, u=None: self._on_done(n, u))
 
         except Exception as exc:
             import traceback
             err = traceback.format_exc()
             Clock.schedule_once(lambda dt, e=err: self._on_error(e))
 
-    def _on_done(self, out_path):
+    def _on_done(self, out_filename, content_uri_str=None):
         self._reset_btn()
-        # Popup avec chemin + bouton Ouvrir
         content = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(12))
         content.add_widget(Label(
-            text="PDF genere :\n" + out_path,
+            text="PDF genere :\n" + out_filename,
             font_size=FS_POPUP, halign="center",
-            text_size=(Window.width * 0.75, None),
-            size_hint_y=None, height=dp(80),
+            text_size=(Window.width * 0.78, None),
+            size_hint_y=None, height=dp(72),
         ))
         btn_row = BoxLayout(size_hint_y=None, height=H_BTN, spacing=dp(8))
-
         popup = Popup(
             title="Termine",
             content=content,
             size_hint=(0.88, None),
-            height=dp(220),
+            height=dp(210),
         )
 
         def _open_pdf(_):
             popup.dismiss()
-            if ANDROID and HAS_JNIUS:
+            if ANDROID and HAS_JNIUS and content_uri_str:
                 try:
-                    Intent        = autoclass("android.content.Intent")
-                    Uri           = autoclass("android.net.Uri")
-                    File          = autoclass("java.io.File")
-                    FileProvider  = autoclass(
-                        "androidx.core.content.FileProvider")
+                    Intent         = autoclass("android.content.Intent")
+                    Uri            = autoclass("android.net.Uri")
                     PythonActivity = autoclass("org.kivy.android.PythonActivity")
-                    ctx     = PythonActivity.mActivity
-                    pkg     = ctx.getPackageName()
-                    f       = File(out_path)
-                    uri     = FileProvider.getUriForFile(
-                        ctx, pkg + ".fileprovider", f)
-                    intent  = Intent(Intent.ACTION_VIEW)
+                    ctx    = PythonActivity.mActivity
+                    uri    = Uri.parse(content_uri_str)
+                    intent = Intent(Intent.ACTION_VIEW)
                     intent.setDataAndType(uri, "application/pdf")
                     intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    ctx.startActivity(intent)
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    ctx.startActivity(
+                        Intent.createChooser(intent, "Ouvrir avec"))
                 except Exception as exc:
-                    self._toast("Ouvrir avec :\n" + out_path, duration=6)
+                    self._toast("Erreur : " + str(exc), duration=4)
+            else:
+                self._toast("Fichier : Telechargements/" + out_filename, duration=5)
 
-        btn_open  = make_btn("Ouvrir le PDF",  bg=C_GREEN,    fg=C_WHITE,
+        btn_open  = make_btn("Ouvrir",  bg=C_GREEN,    fg=C_WHITE,
                              on_press=_open_pdf)
-        btn_close = make_btn("Fermer",         bg=C_GREY_BTN, fg=C_TEXT_DARK,
+        btn_close = make_btn("Fermer",  bg=C_GREY_BTN, fg=C_TEXT_DARK,
                              on_press=lambda _: popup.dismiss())
         btn_row.add_widget(btn_open)
         btn_row.add_widget(btn_close)
