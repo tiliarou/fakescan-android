@@ -51,7 +51,8 @@ if ANDROID:
         HAS_JNIUS = True
 
         # -- Toutes les classes Java chargees UNE SEULE FOIS au demarrage --
-        _File                 = autoclass("java.io.File")
+        _PythonActivity      = autoclass("org.kivy.android.PythonActivity")
+        _Uri                 = autoclass("android.net.Uri")
         _ParcelFileDescriptor = autoclass("android.os.ParcelFileDescriptor")
         _PdfRenderer          = autoclass("android.graphics.pdf.PdfRenderer")
         _PdfRendererPage      = autoclass("android.graphics.pdf.PdfRenderer$Page")
@@ -61,6 +62,11 @@ if ANDROID:
         _ByteArrayOS          = autoclass("java.io.ByteArrayOutputStream")
         _Color_java           = autoclass("android.graphics.Color")
         _Canvas_java          = autoclass("android.graphics.Canvas")
+        _Intent               = autoclass("android.content.Intent")
+        _ContentValues        = autoclass("android.content.ContentValues")
+        _Downloads            = autoclass("android.provider.MediaStore$Downloads")
+        _JavaString           = autoclass("java.lang.String")
+        _Environment          = autoclass("android.os.Environment")
 
     except ImportError:
         HAS_JNIUS = False
@@ -79,7 +85,6 @@ else:
 # -------------------------------------------------------------------------
 
 def ensure_white_bg(img):
-    """Si l'image a un canal alpha (RGBA/LA), composite sur fond blanc."""
     if img.mode in ("RGBA", "LA"):
         bg = Image.new("RGB", img.size, (255, 255, 255))
         bg.paste(img, mask=img.split()[-1])
@@ -137,7 +142,7 @@ H_BTN_GEN  = dp(56)
 H_SLIDER   = dp(48)
 H_SPACER   = dp(16)
 
-PAGE_GAP   = dp(8)   # espace entre pages dans le picker
+PAGE_GAP   = dp(8)
 
 
 def make_btn(text, bg=C_GREY_BTN, fg=C_TEXT_DARK, size_hint_x=1,
@@ -289,11 +294,25 @@ DPI_PREVIEW = 100
 DPI_PROCESS = 250
 
 
+def _android_open_renderer_from_uri(uri_string):
+    """
+    Ouvre un PdfRenderer directement depuis un URI ContentResolver.
+    C'est la SEULE facon fiable sur Android 10+ : on ne passe jamais
+    par un chemin fichier, ce qui evite l'erreur errno 63 (ENODATA).
+    Retourne (renderer, pfd). A fermer apres usage.
+    """
+    context  = _PythonActivity.mActivity
+    resolver = context.getContentResolver()
+    uri      = _Uri.parse(uri_string)
+    pfd      = resolver.openFileDescriptor(uri, "r")
+    renderer = _PdfRenderer(pfd)
+    return renderer, pfd
+
+
 def _android_render_page(renderer, page_index, dpi):
     """
     Rend une page depuis un PdfRenderer DEJA OUVERT.
     NE ferme PAS le renderer. Retourne une PIL Image RGB.
-    Utilise les classes Java pre-chargees au niveau module.
     """
     page   = renderer.openPage(page_index)
     scale  = dpi / 72.0
@@ -303,10 +322,8 @@ def _android_render_page(renderer, page_index, dpi):
     bitmap = _Bitmap.createBitmap(width, height, _BitmapConfig.ARGB_8888)
     canvas = _Canvas_java(bitmap)
     canvas.drawColor(_Color_java.WHITE)
-    # RENDER_MODE_FOR_PRINT (1) est plus stable que FOR_DISPLAY (0)
-    # sur les PDFs complexes (evite l'erreur "Invalid ID")
     page.render(bitmap, None, None, _PdfRendererPage.RENDER_MODE_FOR_PRINT)
-    page.close()   # fermer la PAGE (obligatoire avant d'en ouvrir une autre)
+    page.close()
 
     baos = _ByteArrayOS()
     bitmap.compress(_BitmapCompressFormat.PNG, 100, baos)
@@ -314,39 +331,12 @@ def _android_render_page(renderer, page_index, dpi):
     return ensure_white_bg(img)
 
 
-def _android_open_renderer(pdf_path):
-    """Ouvre et retourne (renderer, pfd) pour pdf_path. A fermer apres usage."""
-    pfd      = _ParcelFileDescriptor.open(_File(pdf_path), _ParcelFileDescriptor.MODE_READ_ONLY)
-    renderer = _PdfRenderer(pfd)
-    return renderer, pfd
-
-
-def _android_pdf_page_count(pdf_path):
-    renderer, pfd = _android_open_renderer(pdf_path)
-    count = renderer.getPageCount()
-    renderer.close()
-    pfd.close()
-    return count
-
-
-def _android_pdf_page_to_pil(pdf_path, page_index=0, dpi=DPI_PREVIEW):
-    """Rend une seule page (ouvre/ferme le renderer). Usage : apercu page unique."""
-    renderer, pfd = _android_open_renderer(pdf_path)
-    try:
-        img = _android_render_page(renderer, page_index, dpi)
-    finally:
-        renderer.close()
-        pfd.close()
-    return img
-
-
-def _android_pdf_all_pages(pdf_path, dpi):
+def _android_pdf_all_pages_uri(uri_string, dpi):
     """
-    Rend TOUTES les pages en ouvrant le renderer UNE SEULE FOIS.
-    Corrige l'erreur 'Invalid ID' qui survenait quand on ouvrait
-    un renderer par page.
+    Rend toutes les pages d'un PDF identifie par son URI ContentResolver.
+    Ouvre le renderer UNE SEULE FOIS pour toutes les pages.
     """
-    renderer, pfd = _android_open_renderer(pdf_path)
+    renderer, pfd = _android_open_renderer_from_uri(uri_string)
     images = []
     try:
         count = renderer.getPageCount()
@@ -358,38 +348,34 @@ def _android_pdf_all_pages(pdf_path, dpi):
     return images
 
 
-def pdf_page_count(pdf_path):
+def _android_pdf_page_count_uri(uri_string):
+    renderer, pfd = _android_open_renderer_from_uri(uri_string)
+    count = renderer.getPageCount()
+    renderer.close()
+    pfd.close()
+    return count
+
+
+def pdf_page_count(pdf_source):
+    """
+    pdf_source : URI string sur Android, chemin fichier sinon.
+    """
     if ANDROID and HAS_JNIUS:
-        return _android_pdf_page_count(pdf_path)
+        return _android_pdf_page_count_uri(pdf_source)
     elif HAS_FITZ:
-        doc = fitz.open(pdf_path)
+        doc = fitz.open(pdf_source)
         n = len(doc)
         doc.close()
         return n
     return 999
 
 
-def pdf_page_to_pil(pdf_path, page_index=0, dpi=DPI_PREVIEW):
-    if ANDROID and HAS_JNIUS:
-        return _android_pdf_page_to_pil(pdf_path, page_index, dpi)
-    elif HAS_FITZ:
-        doc  = fitz.open(pdf_path)
-        page = doc[page_index]
-        mat  = fitz.Matrix(dpi / 72, dpi / 72)
-        pix  = page.get_pixmap(matrix=mat, alpha=False)
-        img  = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-        doc.close()
-        return img
-    raise RuntimeError("Aucun moteur PDF disponible")
-
-
-def pdf_to_pil_list(pdf_path, dpi=DPI_PROCESS):
+def pdf_to_pil_list(pdf_source, dpi=DPI_PROCESS):
     """Rend toutes les pages a haute resolution (generation finale)."""
     if ANDROID and HAS_JNIUS:
-        # Renderer ouvert une seule fois pour toutes les pages
-        return _android_pdf_all_pages(pdf_path, dpi)
+        return _android_pdf_all_pages_uri(pdf_source, dpi)
     elif HAS_FITZ:
-        doc    = fitz.open(pdf_path)
+        doc    = fitz.open(pdf_source)
         mat    = fitz.Matrix(dpi / 72, dpi / 72)
         images = []
         for page in doc:
@@ -400,13 +386,12 @@ def pdf_to_pil_list(pdf_path, dpi=DPI_PROCESS):
     raise RuntimeError("Aucun moteur PDF disponible")
 
 
-def pdf_preview_all_pages(pdf_path, dpi=DPI_PREVIEW):
+def pdf_preview_all_pages(pdf_source, dpi=DPI_PREVIEW):
     """Rend toutes les pages a basse resolution pour la previsualisation."""
     if ANDROID and HAS_JNIUS:
-        # Renderer ouvert une seule fois pour toutes les pages
-        return _android_pdf_all_pages(pdf_path, dpi)
+        return _android_pdf_all_pages_uri(pdf_source, dpi)
     elif HAS_FITZ:
-        doc    = fitz.open(pdf_path)
+        doc    = fitz.open(pdf_source)
         mat    = fitz.Matrix(dpi / 72, dpi / 72)
         images = []
         for page in doc:
@@ -437,15 +422,37 @@ def pil_to_kivy_texture(pil_img):
 
 
 # -------------------------------------------------------------------------
+# IMAGE HELPER : ouvrir une image depuis URI ou chemin
+# -------------------------------------------------------------------------
+
+def open_image_from_source(source):
+    """
+    Ouvre une image PIL depuis un URI ContentResolver (Android)
+    ou depuis un chemin fichier (desktop / fichier temp image).
+    """
+    if ANDROID and HAS_JNIUS and source.startswith("content://"):
+        context  = _PythonActivity.mActivity
+        resolver = context.getContentResolver()
+        uri      = _Uri.parse(source)
+        istream  = resolver.openInputStream(uri)
+        buf = bytearray()
+        chunk = bytearray(65536)
+        while True:
+            n = istream.read(chunk)
+            if n < 0:
+                break
+            buf.extend(bytes(chunk[:n]))
+        istream.close()
+        return Image.open(io.BytesIO(bytes(buf)))
+    else:
+        return Image.open(source)
+
+
+# -------------------------------------------------------------------------
 # WIDGET : CANVAS MULTI-PAGES SCROLLABLE (PickerCanvas)
 # -------------------------------------------------------------------------
 
 class PickerCanvas(Widget):
-    """
-    Affiche toutes les pages PDF empilees verticalement.
-    Encapsulee dans un ScrollView pour le defilement.
-    Le dessin de rectangles se fait sur la page touchee.
-    """
 
     COLOR_PARAFE = (0.62, 0.14, 0.80, 0.45)
     COLOR_SIG    = (0.18, 0.63, 0.18, 0.45)
@@ -574,7 +581,7 @@ class PickerCanvas(Widget):
 
         rx0, ry0 = self._canvas_to_real(min(x0,x1), max(y0,y1), x_off, y_off, dh, scale)
         rx1, ry1 = self._canvas_to_real(max(x0,x1), min(y0,y1), x_off, y_off, dh, scale)
-        rect         = Rect(rx0, ry0, rx1, ry1)
+        rect          = Rect(rx0, ry0, rx1, ry1)
         canvas_coords = (min(x0,x1), min(y0,y1), max(x0,x1), max(y0,y1))
 
         if self.mode == "parafe":
@@ -677,7 +684,7 @@ class PickerScreen(Screen):
         app.sm.current = "main"
         app.main_screen.refresh_zones_label()
 
-    def load_pdf_preview(self, pdf_path):
+    def load_pdf_preview(self, pdf_source):
         """Charge toutes les pages en thread pour ne pas bloquer l'UI."""
         self.status_lbl.text = "Chargement des pages..."
         self.picker.pages = []
@@ -685,7 +692,7 @@ class PickerScreen(Screen):
 
         def _load():
             try:
-                pages = pdf_preview_all_pages(pdf_path, dpi=DPI_PREVIEW)
+                pages = pdf_preview_all_pages(pdf_source, dpi=DPI_PREVIEW)
                 def _done(dt):
                     self.picker.set_pages(pages)
                     app = App.get_running_app()
@@ -695,9 +702,10 @@ class PickerScreen(Screen):
                         n, "s" if n > 1 else "")
                 Clock.schedule_once(_done)
             except Exception as exc:
+                import traceback
+                err = traceback.format_exc()
                 Clock.schedule_once(
-                    lambda dt, e=str(exc): setattr(
-                        self.status_lbl, "text", "Erreur : " + e))
+                    lambda dt, e=err: setattr(self.status_lbl, "text", "Erreur : " + e))
 
         threading.Thread(target=_load, daemon=True).start()
 
@@ -721,60 +729,40 @@ if ANDROID:
             is_pdf = _file_picker_is_pdf
             _file_picker_callback = None
             _file_picker_is_pdf   = False
+
+            if uri is None:
+                return
+
+            uri_string = uri.toString()
+
             try:
-                ContentResolver  = autoclass("android.content.ContentResolver")
-                PythonActivity   = autoclass("org.kivy.android.PythonActivity")
-                context          = PythonActivity.mActivity
-                resolver         = context.getContentResolver()
-                cursor = resolver.query(uri, None, None, None, None)
-                path   = None
-                real_name = None
+                # Recuperer le nom d'affichage via le curseur
+                context  = _PythonActivity.mActivity
+                resolver = context.getContentResolver()
                 display_name = None
-                if cursor and cursor.moveToFirst():
-                    try:
-                        idx = cursor.getColumnIndex("_data")
-                        if idx >= 0:
-                            path = cursor.getString(idx)
-                    except Exception:
-                        pass
-                    try:
+                try:
+                    cursor = resolver.query(uri, None, None, None, None)
+                    if cursor and cursor.moveToFirst():
                         idx2 = cursor.getColumnIndex("_display_name")
                         if idx2 >= 0:
-                            real_name = cursor.getString(idx2)
-                    except Exception:
-                        pass
-                    cursor.close()
-                if not path:
-                    import tempfile
-                    istream = resolver.openInputStream(uri)
-                    suffix  = ".pdf" if is_pdf else ".png"
+                            display_name = cursor.getString(idx2)
+                        cursor.close()
+                except Exception:
+                    pass
+                if not display_name:
                     try:
-                        name = real_name or uri.getLastPathSegment()
-                        if name and "." in name:
-                            suffix = "." + name.rsplit(".", 1)[-1]
+                        display_name = uri.getLastPathSegment()
                     except Exception:
-                        pass
-                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-                    buf = bytearray(65536)
-                    while True:
-                        n = istream.read(buf)
-                        if n < 0:
-                            break
-                        tmp.write(bytes(buf[:n]))
-                    tmp.close()
-                    istream.close()
-                    path = tmp.name
+                        display_name = "fichier"
+
                 if is_pdf:
-                    try:
-                        display_name = real_name or uri.getLastPathSegment()
-                    except Exception:
-                        pass
-                    if not display_name and path:
-                        display_name = os.path.basename(path)
-                    if display_name:
-                        App.get_running_app().pdf_display_name = display_name
-                if path:
-                    Clock.schedule_once(lambda dt: cb(path))
+                    App.get_running_app().pdf_display_name = display_name
+
+                # Pour les images (parafe/signature), on copie encore dans un temp
+                # car PIL ne sait pas lire depuis un InputStream Java directement
+                # (on passe par open_image_from_source qui lit l'URI)
+                Clock.schedule_once(lambda dt: cb(uri_string))
+
             except Exception:
                 import traceback
                 traceback.print_exc()
@@ -787,12 +775,10 @@ def open_file_picker(callback, mime_type="*/*"):
     if ANDROID and HAS_JNIUS:
         _file_picker_callback = callback
         _file_picker_is_pdf   = (mime_type == "application/pdf")
-        Intent         = autoclass("android.content.Intent")
-        PythonActivity = autoclass("org.kivy.android.PythonActivity")
-        intent = Intent(Intent.ACTION_GET_CONTENT)
+        intent = _Intent(_Intent.ACTION_GET_CONTENT)
         intent.setType(mime_type)
-        intent.addCategory(Intent.CATEGORY_OPENABLE)
-        PythonActivity.mActivity.startActivityForResult(intent, 42)
+        intent.addCategory(_Intent.CATEGORY_OPENABLE)
+        _PythonActivity.mActivity.startActivityForResult(intent, 42)
     else:
         filters = ["*.pdf"] if mime_type == "application/pdf" else ["*.png", "*.jpg", "*.jpeg"]
         FilePopup(callback, filters=filters).open()
@@ -965,8 +951,8 @@ class MainScreen(Screen):
         )
         def _on_toggle(btn, *_):
             if btn.state == "down":
-                self.btn_nb.background_color  = C_HEADER if self.btn_nb.state  == "down" else C_GREY_BTN
-                self.btn_col.background_color = C_HEADER if self.btn_col.state == "down" else C_GREY_BTN
+                self.btn_nb.background_color  = C_HEADER    if self.btn_nb.state  == "down" else C_GREY_BTN
+                self.btn_col.background_color = C_HEADER    if self.btn_col.state == "down" else C_GREY_BTN
                 self.btn_nb.color  = C_WHITE     if self.btn_nb.state  == "down" else C_TEXT_DARK
                 self.btn_col.color = C_WHITE     if self.btn_col.state == "down" else C_TEXT_DARK
         self.btn_nb.bind(state=_on_toggle)
@@ -999,18 +985,18 @@ class MainScreen(Screen):
         App.get_running_app().pdf_display_name = None
         open_file_picker(self._on_pdf_selected, mime_type="application/pdf")
 
-    def _on_pdf_selected(self, path):
+    def _on_pdf_selected(self, source):
         app = App.get_running_app()
-        app.pdf_path    = path
+        app.pdf_path    = source   # URI string sur Android, chemin sur desktop
         app.parafe_rect = None
         app.sig_rect    = None
         if not app.pdf_display_name:
-            app.pdf_display_name = os.path.basename(path)
+            app.pdf_display_name = source.split("/")[-1] if "/" in source else source
         self.pdf_label.text  = app.pdf_display_name
         self.pdf_label.color = (0.10, 0.14, 0.55, 1)
         self.btn_picker.disabled = False
         try:
-            app.total_pages = pdf_page_count(path)
+            app.total_pages = pdf_page_count(source)
         except Exception:
             app.total_pages = 999
         self.refresh_zones_label()
@@ -1018,17 +1004,19 @@ class MainScreen(Screen):
     def _pick_parafe(self):
         open_file_picker(self._on_parafe_selected, mime_type="image/*")
 
-    def _on_parafe_selected(self, path):
-        App.get_running_app().parafe_path = path
-        self.parafe_label.text  = os.path.basename(path)
+    def _on_parafe_selected(self, source):
+        App.get_running_app().parafe_path = source
+        name = source.split("/")[-1] if "/" in source else source
+        self.parafe_label.text  = name
         self.parafe_label.color = (0.30, 0.05, 0.40, 1)
 
     def _pick_sig(self):
         open_file_picker(self._on_sig_selected, mime_type="image/*")
 
-    def _on_sig_selected(self, path):
-        App.get_running_app().sig_path = path
-        self.sig_label.text  = os.path.basename(path)
+    def _on_sig_selected(self, source):
+        App.get_running_app().sig_path = source
+        name = source.split("/")[-1] if "/" in source else source
+        self.sig_label.text  = name
         self.sig_label.color = (0.05, 0.35, 0.05, 1)
 
     def _open_picker(self):
@@ -1072,7 +1060,7 @@ class MainScreen(Screen):
 
         params = {
             "pdf_path":     app.pdf_path,
-            "pdf_name":     getattr(app, "pdf_display_name", None) or os.path.basename(app.pdf_path),
+            "pdf_name":     getattr(app, "pdf_display_name", None) or app.pdf_path.split("/")[-1],
             "parafe_path":  app.parafe_path,
             "sig_path":     app.sig_path,
             "parafe_rect":  app.parafe_rect,
@@ -1093,8 +1081,8 @@ class MainScreen(Screen):
             images = pdf_to_pil_list(p["pdf_path"], dpi=DPI_PROCESS)
             total  = len(images)
 
-            parafe_base = Image.open(p["parafe_path"]).convert("RGBA") if p["parafe_path"] else None
-            sig_base    = Image.open(p["sig_path"]).convert("RGBA")    if p["sig_path"]    else None
+            parafe_base = open_image_from_source(p["parafe_path"]).convert("RGBA") if p["parafe_path"] else None
+            sig_base    = open_image_from_source(p["sig_path"]).convert("RGBA")    if p["sig_path"]    else None
 
             out_images = []
             for idx, page_img in enumerate(images):
@@ -1124,26 +1112,26 @@ class MainScreen(Screen):
                 out_images.append(page_img.convert("RGB"))
 
             out_filename = os.path.splitext(p["pdf_name"])[0] + "_scan.pdf"
+            # Supprimer l'extension double eventuelle (.pdf_scan.pdf -> _scan.pdf)
+            if out_filename.endswith(".pdf_scan.pdf"):
+                out_filename = out_filename[:-len(".pdf_scan.pdf")] + "_scan.pdf"
             Clock.schedule_once(lambda dt: self._prog("Encodage PDF..."))
 
             if ANDROID and HAS_JNIUS:
                 try:
-                    ContentValues  = autoclass("android.content.ContentValues")
-                    Downloads      = autoclass("android.provider.MediaStore$Downloads")
-                    PythonActivity = autoclass("org.kivy.android.PythonActivity")
-                    context        = PythonActivity.mActivity
-                    resolver       = context.getContentResolver()
-                    values = ContentValues()
+                    context  = _PythonActivity.mActivity
+                    resolver = context.getContentResolver()
+                    values   = _ContentValues()
                     values.put("_display_name", out_filename)
                     values.put("mime_type",     "application/pdf")
                     values.put("relative_path", "Download/")
                     try:
                         resolver.delete(
-                            Downloads.EXTERNAL_CONTENT_URI,
+                            _Downloads.EXTERNAL_CONTENT_URI,
                             "_display_name=?", [out_filename])
                     except Exception:
                         pass
-                    item_uri = resolver.insert(Downloads.EXTERNAL_CONTENT_URI, values)
+                    item_uri = resolver.insert(_Downloads.EXTERNAL_CONTENT_URI, values)
                     ostream  = resolver.openOutputStream(item_uri)
                     buf      = io.BytesIO()
                     pil_list_to_pdf(out_images, buf)
@@ -1154,15 +1142,15 @@ class MainScreen(Screen):
                         lambda dt, n=out_filename, u=content_uri_str: self._on_done(n, u))
                 except Exception:
                     import traceback; traceback.print_exc()
-                    Environment = autoclass("android.os.Environment")
-                    out_dir  = Environment.getExternalStoragePublicDirectory(
-                        Environment.DIRECTORY_DOWNLOADS).getAbsolutePath()
+                    out_dir  = _Environment.getExternalStoragePublicDirectory(
+                        _Environment.DIRECTORY_DOWNLOADS).getAbsolutePath()
                     out_path = os.path.join(out_dir, out_filename)
                     pil_list_to_pdf(out_images, out_path)
                     Clock.schedule_once(
                         lambda dt, n=out_filename, u=None: self._on_done(n, u))
             else:
-                out_path = os.path.join(os.path.dirname(p["pdf_path"]), out_filename)
+                base = p["pdf_path"] if not p["pdf_path"].startswith("content://") else "/tmp"
+                out_path = os.path.join(os.path.dirname(base), out_filename)
                 pil_list_to_pdf(out_images, out_path)
                 Clock.schedule_once(
                     lambda dt, n=out_filename, u=None: self._on_done(n, u))
@@ -1189,17 +1177,13 @@ class MainScreen(Screen):
             popup.dismiss()
             if ANDROID and HAS_JNIUS and content_uri_str:
                 try:
-                    Intent         = autoclass("android.content.Intent")
-                    Uri            = autoclass("android.net.Uri")
-                    JavaString     = autoclass("java.lang.String")
-                    PythonActivity = autoclass("org.kivy.android.PythonActivity")
-                    ctx    = PythonActivity.mActivity
-                    uri    = Uri.parse(content_uri_str)
-                    intent = Intent(Intent.ACTION_VIEW)
+                    ctx    = _PythonActivity.mActivity
+                    uri    = _Uri.parse(content_uri_str)
+                    intent = _Intent(_Intent.ACTION_VIEW)
                     intent.setDataAndType(uri, "application/pdf")
-                    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    ctx.startActivity(Intent.createChooser(intent, JavaString("Ouvrir avec")))
+                    intent.addFlags(_Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    intent.addFlags(_Intent.FLAG_ACTIVITY_NEW_TASK)
+                    ctx.startActivity(_Intent.createChooser(intent, _JavaString("Ouvrir avec")))
                 except Exception as exc:
                     self._toast("Erreur : " + str(exc), duration=4)
             else:
