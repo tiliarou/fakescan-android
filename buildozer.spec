@@ -38,3 +38,4 @@ log_level   = 2
 warn_on_root = 1
 
 p4a.local_recipes = ./p4a-recipes
+android.add_resource = res/
