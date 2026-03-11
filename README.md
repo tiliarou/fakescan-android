@@ -2,7 +2,7 @@
 
 [![Build Android APK](https://github.com/tiliarou/fakescan-android/actions/workflows/build_apk.yml/badge.svg)](https://github.com/tiliarou/fakescan-android/actions/workflows/build_apk.yml)
 
-Application Android (Kivy + PyMuPDF) qui simule un document imprimé, signé puis scanné.
+Application Android (Kivy + Pillow) qui simule un document imprimé, signé puis scanné.
 
 ---
 
@@ -31,10 +31,20 @@ Application Android (Kivy + PyMuPDF) qui simule un document imprimé, signé pui
 
 | Déclencheur | Action |
 |---|---|
-| Push sur `main` | Build APK debug → artefact téléchargeable 30 jours |
-| Pull Request vers `main` | Build APK debug (validation) |
-| Tag `vX.Y.Z` (ex: `v1.0.0`) | Build APK + création GitHub Release automatique |
+| Push sur `main` | Build APK release → artefact téléchargeable 30 jours |
+| Pull Request vers `main` | Build APK release (validation) |
+| Tag `vX.Y.Z` (ex: `v1.0.0`) | Build APK release + création GitHub Release automatique |
 | Manuel (workflow_dispatch) | Build à la demande depuis l'onglet Actions |
+
+### Secrets requis
+
+Le CI nécessite 3 secrets GitHub (Settings → Secrets and variables → Actions) :
+
+| Secret | Description |
+|---|---|
+| `KEYSTORE_B64` | Keystore encodé en base64 (`base64 -w 0 fakescan.keystore`) |
+| `KEYSTORE_PASSWD` | Mot de passe du keystore |
+| `KEYALIAS_PASSWD` | Mot de passe de l'alias |
 
 ### Créer une Release
 
@@ -43,7 +53,7 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
-GitHub Actions compile l'APK et crée automatiquement une Release avec le fichier `.apk` en pièce jointe.
+GitHub Actions compile l'APK signé et crée automatiquement une Release avec le fichier `.apk` en pièce jointe.
 
 ---
 
@@ -52,7 +62,7 @@ GitHub Actions compile l'APK et crée automatiquement une Release avec le fichie
 ### Tester sur PC (sans compiler)
 
 ```bash
-pip install kivy pymupdf pillow numpy
+pip install kivy pillow plyer
 python main.py
 ```
 
@@ -67,11 +77,18 @@ sudo apt-get install -y python3-pip git zip unzip openjdk-17-jdk \
 # Buildozer
 pip install buildozer cython
 
-# Build
-buildozer android debug
+# Générer le keystore (une seule fois)
+keytool -genkey -v -keystore fakescan.keystore \
+  -alias fakescan -keyalg RSA -keysize 2048 -validity 10000
+
+# Renseigner les mots de passe dans buildozer.spec
+# (remplacer YOUR_PASSWORD par le vrai mot de passe)
+
+# Build release
+buildozer android release
 
 # Installer sur téléphone (ADB)
-adb install bin/fakescanpdf-1.0-debug.apk
+adb install bin/fakescanpdf-1.0-arm64-v8a_armeabi-v7a-release.apk
 ```
 
 ---
@@ -81,7 +98,6 @@ adb install bin/fakescanpdf-1.0-debug.apk
 | Package | Rôle |
 |---|---|
 | [Kivy](https://kivy.org) | UI multiplateforme / Android |
-| [PyMuPDF](https://pymupdf.readthedocs.io) | Lecture/écriture PDF (pas de Poppler) |
-| [Pillow](https://pillow.readthedocs.io) | Traitement image |
-| [NumPy](https://numpy.org) | Bruit grain (optionnel, accélère) |
+| [Pillow](https://pillow.readthedocs.io) | Lecture PDF, traitement image |
+| [Plyer](https://plyer.readthedocs.io) | Accès fichiers natifs Android |
 | [Buildozer](https://buildozer.readthedocs.io) | Compilation APK |
