@@ -483,10 +483,10 @@ class PickerCanvas(Widget):
         rect = Rect(rx0, ry0_f, rx1, ry1_f)
         if self.mode == "parafe":
             self.rect_parafe         = rect
-            self._rect_parafe_canvas = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+            self._rect_parafe_canvas = (min(x0, x1), min(y0, y1), max(x0, y1), max(y0, y1))
         else:
             self.rect_sig            = rect
-            self._rect_sig_canvas    = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+            self._rect_sig_canvas    = (min(x0, x1), min(y0, y1), max(x0, y1), max(y0, y1))
         self._redraw()
         return True
 
@@ -602,6 +602,7 @@ if ANDROID:
                 cursor = resolver.query(uri, None, None, None, None)
                 path   = None
                 real_name = None
+                display_name = None
                 if cursor and cursor.moveToFirst():
                     try:
                         idx = cursor.getColumnIndex("_data")
@@ -638,13 +639,23 @@ if ANDROID:
                     tmp.close()
                     istream.close()
                     path = tmp.name
+
+                # Déterminer un nom "humain" pour le PDF
+                try:
                     if real_name:
-                        App.get_running_app().pdf_display_name = real_name
+                        display_name = real_name
+                    else:
+                        seg = uri.getLastPathSegment()
+                        if seg:
+                            display_name = seg
+                except Exception:
+                    pass
+                if not display_name and path:
+                    display_name = os.path.basename(path)
+                if display_name:
+                    App.get_running_app().pdf_display_name = display_name
 
                 if path:
-                    # Stocker le vrai nom pour le fichier de sortie
-                    if real_name:
-                        App.get_running_app().pdf_display_name = real_name
                     Clock.schedule_once(lambda dt: cb(path))
             except Exception as exc:
                 import traceback
