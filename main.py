@@ -69,33 +69,9 @@ if ANDROID:
         _JavaString           = autoclass("java.lang.String")
         _Environment          = autoclass("android.os.Environment")
         _File                 = autoclass("java.io.File")
-        _IOUtils              = autoclass("org.apache.commons.io.IOUtils")
 
-    except Exception:
-        # org.apache.commons.io.IOUtils peut ne pas etre dispo
-        try:
-            from jnius import autoclass
-            HAS_JNIUS = True
-            _PythonActivity       = autoclass("org.kivy.android.PythonActivity")
-            _Uri                  = autoclass("android.net.Uri")
-            _ParcelFileDescriptor = autoclass("android.os.ParcelFileDescriptor")
-            _PdfRenderer          = autoclass("android.graphics.pdf.PdfRenderer")
-            _PdfRendererPage      = autoclass("android.graphics.pdf.PdfRenderer$Page")
-            _Bitmap               = autoclass("android.graphics.Bitmap")
-            _BitmapConfig         = autoclass("android.graphics.Bitmap$Config")
-            _BitmapCompressFormat = autoclass("android.graphics.Bitmap$CompressFormat")
-            _ByteArrayOS          = autoclass("java.io.ByteArrayOutputStream")
-            _Color_java           = autoclass("android.graphics.Color")
-            _Canvas_java          = autoclass("android.graphics.Canvas")
-            _Intent               = autoclass("android.content.Intent")
-            _ContentValues        = autoclass("android.content.ContentValues")
-            _Downloads            = autoclass("android.provider.MediaStore$Downloads")
-            _JavaString           = autoclass("java.lang.String")
-            _Environment          = autoclass("android.os.Environment")
-            _File                 = autoclass("java.io.File")
-            _IOUtils              = None
-        except ImportError:
-            HAS_JNIUS = False
+    except ImportError:
+        HAS_JNIUS = False
     HAS_FITZ = False
 else:
     HAS_JNIUS = False
@@ -324,25 +300,30 @@ def _android_read_uri_to_bytes(uri_string):
     """
     Lit TOUT le contenu d'un URI ContentResolver en bytes Python.
 
-    IMPORTANT : Jnius ne peut pas lire dans un bytearray Python via
-    InputStream.read(byte[]) — la methode Java attend un tableau Java.
-    On passe donc par un ByteArrayOutputStream Java pur, qui lit
-    le stream entier sans aucun transfert de buffer Python<->Java.
+    Strategie : on appelle istream.read() SANS argument, ce qui retourne
+    un int (0-255) par appel, ou -1 en fin de stream. Cela ne necessite
+    AUCUN tableau Java et evite l'erreur "No constructor available" de Jnius
+    lors de la creation de byte[] via autoclass("[B").
+
+    La copie est faite via transferTo() de Java 9+ si disponible,
+    sinon via la boucle read()-par-octet dans un ByteArrayOutputStream.
     """
     context  = _PythonActivity.mActivity
     resolver = context.getContentResolver()
     uri      = _Uri.parse(uri_string)
     istream  = resolver.openInputStream(uri)
-
-    baos = _ByteArrayOS()
-    # Lire par blocs de 64 Ko en Java pur via un tableau Java
-    _JavaByteArray = autoclass("[B")  # byte[] Java
-    buf = _JavaByteArray(65536)       # byte[65536]
-    while True:
-        n = istream.read(buf)
-        if n < 0:
-            break
-        baos.write(buf, 0, n)
+    baos     = _ByteArrayOS()
+    # transferTo() existe depuis Java 9 / API 33 (Android 13).
+    # Sur les appareils plus anciens on tombe dans le except.
+    try:
+        istream.transferTo(baos)
+    except Exception:
+        # Fallback : lecture octet par octet (lent mais universel)
+        while True:
+            b = istream.read()   # retourne int 0-255 ou -1
+            if b < 0:
+                break
+            baos.write(b)
     istream.close()
     return bytes(baos.toByteArray())
 
@@ -350,7 +331,6 @@ def _android_read_uri_to_bytes(uri_string):
 def _android_uri_to_seekable_file(uri_string, suffix=".pdf"):
     """
     Copie le contenu d'un URI dans un fichier temp du CacheDir (seekable).
-    Utilise _android_read_uri_to_bytes pour la lecture (100% Java).
     """
     data      = _android_read_uri_to_bytes(uri_string)
     cache_dir = _PythonActivity.mActivity.getCacheDir().getAbsolutePath()
@@ -491,12 +471,6 @@ def pil_to_kivy_texture(pil_img):
 # -------------------------------------------------------------------------
 
 def open_image_from_source(source):
-    """
-    Ouvre une image PIL depuis un URI ContentResolver (Android)
-    ou depuis un chemin fichier (desktop).
-    Utilise _android_read_uri_to_bytes pour eviter le meme probleme
-    de lecture Jnius avec les bytearrays Python.
-    """
     if ANDROID and HAS_JNIUS and source.startswith("content://"):
         data = _android_read_uri_to_bytes(source)
         return Image.open(io.BytesIO(data))
