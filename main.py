@@ -25,10 +25,7 @@ Note moteur PDF Android :
        pour destClip et transform. None Python -> jobject invalide.
     3. Un seul PdfRenderer par fichier, du debut a la fin.
     4. RENDER_MODE_FOR_DISPLAY = 1 (entier, pas l'attribut jnius).
-    5. BitmapConfig.ARGB_8888 via jnius retourne un jobject corrompu
-       sur certains firmwares -> SIGSEGV dans PDFium.
-       SOLUTION : passer directement l'entier 4 (valeur Android stable
-       depuis API 1, jamais changee) a Bitmap.createBitmap().
+    5. BITMAP_ARGB_8888 = 4 (entier brut, pas jnius) pour createBitmap.
 """
 
 import io
@@ -96,9 +93,8 @@ PDF_RENDER_MODE_FOR_DISPLAY = 1
 
 # BITMAP_ARGB_8888 = 4 en dur.
 # android.graphics.Bitmap$Config.ARGB_8888 via jnius retourne un jobject
-# corrompu sur certains firmwares, ce qui provoque un SIGSEGV dans PDFium
-# natif au moment de Bitmap.createBitmap(). La valeur entiere 4 correspond
-# a ARGB_8888 depuis Android API 1 et n'a jamais change.
+# corrompu sur certains firmwares -> SIGSEGV dans PDFium natif.
+# La valeur entiere 4 = ARGB_8888 depuis Android API 1, jamais changee.
 BITMAP_ARGB_8888 = 4
 
 if ANDROID:
@@ -339,7 +335,9 @@ def parse_pages(text, total_pages):
 # PDF HELPERS
 # -------------------------------------------------------------------------
 
-DPI_PREVIEW = 100
+# DPI reduit a 72 pour la preview (= taille native PDF, 0 upscale)
+# => Bitmap minimal, elimine tout risque OOM sur le premier rendu
+DPI_PREVIEW = 72
 DPI_PROCESS = 250
 
 
@@ -370,9 +368,6 @@ def _android_uri_to_seekable_file(uri_string, suffix=".pdf"):
 
 
 def _android_read_uri_to_bytes(uri_string):
-    """
-    Lit un URI ContentResolver en bytes Python via fd POSIX.
-    """
     context  = _PythonActivity.mActivity
     resolver = context.getContentResolver()
     uri      = _Uri.parse(uri_string)
@@ -394,9 +389,14 @@ def _bitmap_to_pil(bitmap):
     """
     Convertit un Bitmap Android ARGB_8888 en PIL.Image RGB via PNG compress.
     """
+    _log("_bitmap_to_pil: START compress")
     baos = _ByteArrayOS()
     bitmap.compress(_BitmapCompressFormat.PNG, 100, baos)
-    return Image.open(io.BytesIO(bytes(baos.toByteArray())))
+    _log("_bitmap_to_pil: compress OK, bytes={}".format(baos.size()))
+    data = bytes(baos.toByteArray())
+    img  = Image.open(io.BytesIO(data))
+    _log("_bitmap_to_pil: PIL open OK mode={} size={}".format(img.mode, img.size))
+    return img
 
 
 def _android_pdf_all_pages_uri(uri_string, dpi):
@@ -407,10 +407,11 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
     via Clock.schedule_once(). Le thread daemon attend via threading.Event.
 
     Points critiques :
-    - cast('android.graphics.Rect', None) et cast('android.graphics.Matrix', None)
-      pour les parametres optionnels de page.render() (pas None Python).
-    - BITMAP_ARGB_8888 = 4 (entier, pas jnius) pour Bitmap.createBitmap().
-    - PDF_RENDER_MODE_FOR_DISPLAY = 1 (entier, pas l'attribut jnius).
+    - cast('android.graphics.Rect', None) / cast('android.graphics.Matrix', None)
+      pour les null Java de page.render().
+    - BITMAP_ARGB_8888 = 4 (entier brut, evite jobject jnius corrompu).
+    - PDF_RENDER_MODE_FOR_DISPLAY = 1 (entier brut).
+    - DPI_PREVIEW = 72 (taille native, bitmap minimal).
     """
     _log("_android_pdf_all_pages_uri: uri={} dpi={}".format(uri_string[:60], dpi))
 
@@ -422,52 +423,76 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
     def _render_on_main_thread(dt):
         renderer = None
         try:
-            pfd      = _ParcelFileDescriptor.open(
+            _log("RENDER: opening ParcelFileDescriptor")
+            pfd = _ParcelFileDescriptor.open(
                 _File(tmp_path), _ParcelFileDescriptor.MODE_READ_ONLY
             )
+            _log("RENDER: creating PdfRenderer")
             renderer = _PdfRenderer(pfd)
             count    = renderer.getPageCount()
-            _log("_render_on_main_thread: pageCount={}".format(count))
+            _log("RENDER: pageCount={}".format(count))
             images = []
 
-            # null Java types pour destClip et transform
             null_rect   = cast("android.graphics.Rect",   None)
             null_matrix = cast("android.graphics.Matrix", None)
+            _log("RENDER: null_rect={} null_matrix={}".format(
+                type(null_rect).__name__, type(null_matrix).__name__))
 
             for i in range(count):
-                _log("_render_on_main_thread: page {}/{}".format(i + 1, count))
+                _log("RENDER: --- page {}/{} START ---".format(i + 1, count))
+
+                _log("RENDER: calling renderer.openPage({})".format(i))
                 page = renderer.openPage(i)
+                _log("RENDER: openPage OK")
+
                 try:
                     scale = dpi / 72.0
                     w = max(1, int(page.getWidth()  * scale))
                     h = max(1, int(page.getHeight() * scale))
-                    _log("_render_on_main_thread: bitmap {}x{} config=ARGB_8888(4)".format(w, h))
-                    # BITMAP_ARGB_8888 = 4 (entier brut, evite le jobject jnius corrompu)
+                    _log("RENDER: page dims={}x{} (dpi={}, scale={:.2f})".format(w, h, dpi, scale))
+
+                    _log("RENDER: calling Bitmap.createBitmap({}, {}, {})".format(w, h, BITMAP_ARGB_8888))
                     bitmap = _Bitmap.createBitmap(w, h, BITMAP_ARGB_8888)
+                    _log("RENDER: createBitmap OK bitmap={}".format(type(bitmap).__name__))
+
+                    _log("RENDER: calling eraseColor(WHITE)")
                     bitmap.eraseColor(_Color_java.WHITE)
+                    _log("RENDER: eraseColor OK")
+
+                    _log("RENDER: calling page.render(bitmap, null_rect, null_matrix, {})".format(
+                        PDF_RENDER_MODE_FOR_DISPLAY))
                     page.render(bitmap, null_rect, null_matrix, PDF_RENDER_MODE_FOR_DISPLAY)
+                    _log("RENDER: page.render OK")
+
                     img = _bitmap_to_pil(bitmap)
                     images.append(ensure_white_bg(img))
-                    _log("_render_on_main_thread: page {} OK".format(i + 1))
+                    _log("RENDER: page {} DONE".format(i + 1))
+
                 finally:
+                    _log("RENDER: closing page {}".format(i))
                     page.close()
+                    _log("RENDER: page {} closed".format(i))
+
             result.append(images)
-            _log("_render_on_main_thread: done, {} pages".format(len(images)))
-        except Exception as exc:
-            _log("_render_on_main_thread ERROR: " + _traceback.format_exc())
-            result.append(exc)
+            _log("RENDER: ALL DONE, {} images".format(len(images)))
+
+        except Exception:
+            _log("RENDER ERROR: " + _traceback.format_exc())
+            result.append(RuntimeError(_traceback.format_exc()))
         finally:
             if renderer is not None:
                 try:
                     renderer.close()
+                    _log("RENDER: renderer.close() OK")
                 except Exception as e:
-                    _log("renderer.close() error: {}".format(e))
+                    _log("RENDER: renderer.close() ERROR: {}".format(e))
             try:
                 os.unlink(tmp_path)
-                _log("_render_on_main_thread: tmp deleted")
+                _log("RENDER: tmp deleted")
             except Exception as e:
-                _log("unlink tmp error: {}".format(e))
+                _log("RENDER: unlink error: {}".format(e))
             event.set()
+            _log("RENDER: event set")
 
     Clock.schedule_once(_render_on_main_thread, 0)
     finished = event.wait(timeout=60)
@@ -791,10 +816,6 @@ class PickerScreen(Screen):
         app.main_screen.refresh_zones_label()
 
     def load_pdf_preview(self, pdf_source):
-        """
-        Lance le chargement de la preview dans un thread daemon.
-        Le rendu PdfRenderer est dispatch sur le main thread via Clock.
-        """
         self.status_lbl.text = "Chargement des pages..."
         self.picker.pages = []
         self.picker.canvas.clear()
