@@ -297,29 +297,19 @@ DPI_PROCESS = 250
 
 def _android_uri_to_seekable_file(uri_string, suffix=".pdf"):
     """
-    Copie un URI ContentResolver dans un fichier temp seekable.
-
-    STRATEGIE DEFINITIVE :
-      On ouvre le ParcelFileDescriptor de l'URI en lecture (MODE_READ_ONLY),
-      on recupere le file descriptor POSIX entier via getFd(), puis on lit
-      en Python pur avec os.read() en blocs de 64 Ko.
-      Zero transfert Jnius de bytes, zero tableau Java, zero ByteArrayOS.
-
-      PdfRenderer exige un fichier seekable : on copie dans le CacheDir.
+    Copie un URI ContentResolver dans un fichier temp seekable via fd POSIX.
+    PdfRenderer exige un fichier seekable : on copie dans le CacheDir.
     """
-    context  = _PythonActivity.mActivity
-    resolver = context.getContentResolver()
-    uri      = _Uri.parse(uri_string)
-
-    # Ouvre un PFD en lecture sur l'URI
-    pfd_src  = resolver.openFileDescriptor(uri, "r")
-    src_fd   = pfd_src.getFd()          # int : file descriptor POSIX
-
+    context   = _PythonActivity.mActivity
+    resolver  = context.getContentResolver()
+    uri       = _Uri.parse(uri_string)
+    pfd_src   = resolver.openFileDescriptor(uri, "r")
+    src_fd    = pfd_src.getFd()
     cache_dir = context.getCacheDir().getAbsolutePath()
     fd_dst, tmp_path = tempfile.mkstemp(suffix=suffix, dir=cache_dir)
     try:
         while True:
-            chunk = os.read(src_fd, 65536)  # lecture Python pure, 64 Ko
+            chunk = os.read(src_fd, 65536)
             if not chunk:
                 break
             os.write(fd_dst, chunk)
@@ -327,15 +317,12 @@ def _android_uri_to_seekable_file(uri_string, suffix=".pdf"):
     finally:
         os.close(fd_dst)
         pfd_src.close()
-
     return tmp_path
 
 
 def _android_read_uri_to_bytes(uri_string):
     """
     Lit un URI ContentResolver en bytes Python via fd POSIX.
-    Utilise la meme strategie que _android_uri_to_seekable_file
-    mais retourne les bytes directement (pour les images).
     """
     context  = _PythonActivity.mActivity
     resolver = context.getContentResolver()
@@ -354,63 +341,77 @@ def _android_read_uri_to_bytes(uri_string):
     return b"".join(chunks)
 
 
-def _android_open_renderer_from_path(path):
-    """Ouvre un PdfRenderer depuis un chemin fichier local."""
+def _android_render_page_from_path(path, page_index, dpi):
+    """
+    Ouvre un PdfRenderer sur le fichier local, rend la page demandee,
+    ferme le renderer.
+
+    IMPORTANT : PdfRenderer prend ownership du ParcelFileDescriptor passe
+    a son constructeur et le ferme lui-meme via renderer.close().
+    On ne doit donc JAMAIS appeler pfd.close() apres renderer.close()
+    sous peine de fermer un fd deja recycle par le kernel (bug fd 63).
+    """
     pfd      = _ParcelFileDescriptor.open(
         _File(path), _ParcelFileDescriptor.MODE_READ_ONLY
     )
     renderer = _PdfRenderer(pfd)
-    return renderer, pfd
-
-
-def _android_render_page(renderer, page_index, dpi):
-    """Rend une page PDF en PIL Image RGB."""
-    page   = renderer.openPage(page_index)
-    scale  = dpi / 72.0
-    width  = int(page.getWidth()  * scale)
-    height = int(page.getHeight() * scale)
-
-    bitmap = _Bitmap.createBitmap(width, height, _BitmapConfig.ARGB_8888)
-    canvas = _Canvas_java(bitmap)
-    canvas.drawColor(_Color_java.WHITE)
-    page.render(bitmap, None, None, _PdfRendererPage.RENDER_MODE_FOR_PRINT)
-    page.close()
-
-    baos = _ByteArrayOS()
-    bitmap.compress(_BitmapCompressFormat.PNG, 100, baos)
-    img = Image.open(io.BytesIO(bytes(baos.toByteArray())))
-    return ensure_white_bg(img)
+    # pfd est desormais sous la responsabilite de renderer
+    try:
+        page   = renderer.openPage(page_index)
+        scale  = dpi / 72.0
+        width  = int(page.getWidth()  * scale)
+        height = int(page.getHeight() * scale)
+        bitmap = _Bitmap.createBitmap(width, height, _BitmapConfig.ARGB_8888)
+        canvas = _Canvas_java(bitmap)
+        canvas.drawColor(_Color_java.WHITE)
+        page.render(bitmap, None, None, _PdfRendererPage.RENDER_MODE_FOR_PRINT)
+        page.close()
+        baos = _ByteArrayOS()
+        bitmap.compress(_BitmapCompressFormat.PNG, 100, baos)
+        img = Image.open(io.BytesIO(bytes(baos.toByteArray())))
+        return ensure_white_bg(img)
+    finally:
+        renderer.close()  # ferme aussi pfd en interne — ne pas rappeler pfd.close()
 
 
 def _android_pdf_all_pages_uri(uri_string, dpi):
     tmp_path = _android_uri_to_seekable_file(uri_string, suffix=".pdf")
-    renderer, pfd = _android_open_renderer_from_path(tmp_path)
-    images = []
     try:
-        count = renderer.getPageCount()
+        # Ouvre une premiere fois juste pour connaitre le nombre de pages
+        pfd_count = _ParcelFileDescriptor.open(
+            _File(tmp_path), _ParcelFileDescriptor.MODE_READ_ONLY
+        )
+        renderer_count = _PdfRenderer(pfd_count)
+        count = renderer_count.getPageCount()
+        renderer_count.close()  # ferme pfd_count en interne
+
+        images = []
         for i in range(count):
-            images.append(_android_render_page(renderer, i, dpi))
+            # Chaque appel ouvre+ferme son propre renderer+pfd
+            images.append(_android_render_page_from_path(tmp_path, i, dpi))
+        return images
     finally:
-        renderer.close()
-        pfd.close()
         try:
             os.unlink(tmp_path)
         except Exception:
             pass
-    return images
 
 
 def _android_pdf_page_count_uri(uri_string):
     tmp_path = _android_uri_to_seekable_file(uri_string, suffix=".pdf")
-    renderer, pfd = _android_open_renderer_from_path(tmp_path)
-    count = renderer.getPageCount()
-    renderer.close()
-    pfd.close()
     try:
-        os.unlink(tmp_path)
-    except Exception:
-        pass
-    return count
+        pfd      = _ParcelFileDescriptor.open(
+            _File(tmp_path), _ParcelFileDescriptor.MODE_READ_ONLY
+        )
+        renderer = _PdfRenderer(pfd)
+        count    = renderer.getPageCount()
+        renderer.close()  # ferme pfd en interne
+        return count
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
 
 
 def pdf_page_count(pdf_source):
