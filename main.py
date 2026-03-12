@@ -69,9 +69,33 @@ if ANDROID:
         _JavaString           = autoclass("java.lang.String")
         _Environment          = autoclass("android.os.Environment")
         _File                 = autoclass("java.io.File")
+        _IOUtils              = autoclass("org.apache.commons.io.IOUtils")
 
-    except ImportError:
-        HAS_JNIUS = False
+    except Exception:
+        # org.apache.commons.io.IOUtils peut ne pas etre dispo
+        try:
+            from jnius import autoclass
+            HAS_JNIUS = True
+            _PythonActivity       = autoclass("org.kivy.android.PythonActivity")
+            _Uri                  = autoclass("android.net.Uri")
+            _ParcelFileDescriptor = autoclass("android.os.ParcelFileDescriptor")
+            _PdfRenderer          = autoclass("android.graphics.pdf.PdfRenderer")
+            _PdfRendererPage      = autoclass("android.graphics.pdf.PdfRenderer$Page")
+            _Bitmap               = autoclass("android.graphics.Bitmap")
+            _BitmapConfig         = autoclass("android.graphics.Bitmap$Config")
+            _BitmapCompressFormat = autoclass("android.graphics.Bitmap$CompressFormat")
+            _ByteArrayOS          = autoclass("java.io.ByteArrayOutputStream")
+            _Color_java           = autoclass("android.graphics.Color")
+            _Canvas_java          = autoclass("android.graphics.Canvas")
+            _Intent               = autoclass("android.content.Intent")
+            _ContentValues        = autoclass("android.content.ContentValues")
+            _Downloads            = autoclass("android.provider.MediaStore$Downloads")
+            _JavaString           = autoclass("java.lang.String")
+            _Environment          = autoclass("android.os.Environment")
+            _File                 = autoclass("java.io.File")
+            _IOUtils              = None
+        except ImportError:
+            HAS_JNIUS = False
     HAS_FITZ = False
 else:
     HAS_JNIUS = False
@@ -296,44 +320,51 @@ DPI_PREVIEW = 100
 DPI_PROCESS = 250
 
 
-def _android_get_cache_dir():
-    """Retourne le repertoire cache prive de l'app (toujours accessible en R/W)."""
-    return _PythonActivity.mActivity.getCacheDir().getAbsolutePath()
-
-
-def _android_uri_to_seekable_file(uri_string, suffix=".pdf"):
+def _android_read_uri_to_bytes(uri_string):
     """
-    Copie le contenu d'un URI ContentResolver dans un fichier temp
-    situe dans le CacheDir de l'app (seekable, accessible par PdfRenderer).
-    Retourne le chemin du fichier temp.
+    Lit TOUT le contenu d'un URI ContentResolver en bytes Python.
+
+    IMPORTANT : Jnius ne peut pas lire dans un bytearray Python via
+    InputStream.read(byte[]) — la methode Java attend un tableau Java.
+    On passe donc par un ByteArrayOutputStream Java pur, qui lit
+    le stream entier sans aucun transfert de buffer Python<->Java.
     """
     context  = _PythonActivity.mActivity
     resolver = context.getContentResolver()
     uri      = _Uri.parse(uri_string)
     istream  = resolver.openInputStream(uri)
 
-    cache_dir = _android_get_cache_dir()
-    tmp = tempfile.NamedTemporaryFile(
-        delete=False, suffix=suffix, dir=cache_dir
-    )
-    buf = bytearray(65536)
+    baos = _ByteArrayOS()
+    # Lire par blocs de 64 Ko en Java pur via un tableau Java
+    _JavaByteArray = autoclass("[B")  # byte[] Java
+    buf = _JavaByteArray(65536)       # byte[65536]
     while True:
         n = istream.read(buf)
         if n < 0:
             break
-        tmp.write(bytes(buf[:n]))
-    tmp.flush()
-    os.fsync(tmp.fileno())   # garantit que tout est ecrit sur disque
-    tmp.close()
+        baos.write(buf, 0, n)
     istream.close()
-    return tmp.name
+    return bytes(baos.toByteArray())
+
+
+def _android_uri_to_seekable_file(uri_string, suffix=".pdf"):
+    """
+    Copie le contenu d'un URI dans un fichier temp du CacheDir (seekable).
+    Utilise _android_read_uri_to_bytes pour la lecture (100% Java).
+    """
+    data      = _android_read_uri_to_bytes(uri_string)
+    cache_dir = _PythonActivity.mActivity.getCacheDir().getAbsolutePath()
+    fd, tmp_path = tempfile.mkstemp(suffix=suffix, dir=cache_dir)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return tmp_path
 
 
 def _android_open_renderer_from_path(path):
-    """
-    Ouvre un PdfRenderer depuis un chemin fichier local (seekable garanti).
-    Retourne (renderer, pfd).
-    """
+    """Ouvre un PdfRenderer depuis un chemin fichier local. Retourne (renderer, pfd)."""
     pfd      = _ParcelFileDescriptor.open(
         _File(path), _ParcelFileDescriptor.MODE_READ_ONLY
     )
@@ -342,10 +373,7 @@ def _android_open_renderer_from_path(path):
 
 
 def _android_render_page(renderer, page_index, dpi):
-    """
-    Rend une page depuis un PdfRenderer DEJA OUVERT.
-    NE ferme PAS le renderer. Retourne une PIL Image RGB.
-    """
+    """Rend une page depuis un PdfRenderer DEJA OUVERT. Retourne une PIL Image RGB."""
     page   = renderer.openPage(page_index)
     scale  = dpi / 72.0
     width  = int(page.getWidth()  * scale)
@@ -365,9 +393,7 @@ def _android_render_page(renderer, page_index, dpi):
 
 def _android_pdf_all_pages_uri(uri_string, dpi):
     """
-    Rend toutes les pages d'un PDF identifie par son URI.
-    Copie d'abord dans un fichier CacheDir seekable, puis ouvre
-    le PdfRenderer une seule fois pour toutes les pages.
+    Rend toutes les pages : copie dans CacheDir, ouvre le renderer une seule fois.
     Supprime le fichier temp a la fin.
     """
     tmp_path = _android_uri_to_seekable_file(uri_string, suffix=".pdf")
@@ -468,21 +494,12 @@ def open_image_from_source(source):
     """
     Ouvre une image PIL depuis un URI ContentResolver (Android)
     ou depuis un chemin fichier (desktop).
+    Utilise _android_read_uri_to_bytes pour eviter le meme probleme
+    de lecture Jnius avec les bytearrays Python.
     """
     if ANDROID and HAS_JNIUS and source.startswith("content://"):
-        context  = _PythonActivity.mActivity
-        resolver = context.getContentResolver()
-        uri      = _Uri.parse(source)
-        istream  = resolver.openInputStream(uri)
-        buf = bytearray()
-        chunk = bytearray(65536)
-        while True:
-            n = istream.read(chunk)
-            if n < 0:
-                break
-            buf.extend(bytes(chunk[:n]))
-        istream.close()
-        return Image.open(io.BytesIO(bytes(buf)))
+        data = _android_read_uri_to_bytes(source)
+        return Image.open(io.BytesIO(data))
     else:
         return Image.open(source)
 
