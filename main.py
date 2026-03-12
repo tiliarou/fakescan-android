@@ -26,6 +26,12 @@ Note moteur PDF Android :
     2. NE PAS creer de Canvas Java avant page.render() :
        On utilise bitmap.eraseColor(Color.WHITE) a la place.
     3. Un seul PdfRenderer par fichier, du debut a la fin.
+    4. RENDER_MODE_FOR_DISPLAY = 1 (constante entiere, NE PAS utiliser
+       _PdfRendererPage.RENDER_MODE_FOR_DISPLAY qui retourne None via
+       jnius sur certains appareils Android).
+    5. BitmapConfig : utiliser autoclass("android.graphics.Bitmap$Config")
+       et acceder a ARGB_8888 via cet objet. Logger sa valeur au demarrage
+       pour detecter toute regression.
 """
 
 import io
@@ -88,6 +94,12 @@ else:
     HAS_FITZ = False
 
 # -- jnius / PdfRenderer : Android uniquement ------------------------------
+# RENDER_MODE_FOR_DISPLAY = 1 en dur (constante Android stable depuis API 21).
+# NE PAS utiliser _PdfRendererPage.RENDER_MODE_FOR_DISPLAY : jnius retourne
+# None pour les champs statiques des classes internes ($Page) sur certains
+# appareils/versions, ce qui provoque "Invalid ID: 63" dans PDFium natif.
+PDF_RENDER_MODE_FOR_DISPLAY = 1
+
 if ANDROID:
     try:
         from jnius import autoclass
@@ -97,7 +109,6 @@ if ANDROID:
         _Uri                  = autoclass("android.net.Uri")
         _ParcelFileDescriptor = autoclass("android.os.ParcelFileDescriptor")
         _PdfRenderer          = autoclass("android.graphics.pdf.PdfRenderer")
-        _PdfRendererPage      = autoclass("android.graphics.pdf.PdfRenderer$Page")
         _Bitmap               = autoclass("android.graphics.Bitmap")
         _BitmapConfig         = autoclass("android.graphics.Bitmap$Config")
         _BitmapCompressFormat = autoclass("android.graphics.Bitmap$CompressFormat")
@@ -109,6 +120,13 @@ if ANDROID:
         _JavaString           = autoclass("java.lang.String")
         _Environment          = autoclass("android.os.Environment")
         _File                 = autoclass("java.io.File")
+
+        # Log de diagnostic au demarrage pour detecter tout probleme jnius
+        try:
+            _argb8888 = _BitmapConfig.ARGB_8888
+            _log("INIT: BitmapConfig.ARGB_8888={}".format(_argb8888))
+        except Exception as _e:
+            _log("INIT: BitmapConfig.ARGB_8888 inaccessible: {}".format(_e))
 
     except ImportError:
         HAS_JNIUS = False
@@ -401,6 +419,11 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
     thread via Clock.schedule_once(). Le thread appelant (daemon)
     attend la completion via threading.Event.
 
+    CORRECTIF PRINCIPAL :
+    page.render() recoit PDF_RENDER_MODE_FOR_DISPLAY = 1 (entier Python),
+    PAS _PdfRendererPage.RENDER_MODE_FOR_DISPLAY qui vaut None via jnius
+    sur les classes internes Android$InnerClass.
+
     Schema :
       thread daemon  ──Clock.schedule_once──>  main thread (Looper OK)
           |                                        |
@@ -420,6 +443,10 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
         """
         Executee sur le main thread Android (Looper present).
         Ouvre PdfRenderer, rend toutes les pages, ferme tout.
+
+        IMPORTANT : on passe PDF_RENDER_MODE_FOR_DISPLAY (int=1) directement
+        a page.render() et non _PdfRendererPage.RENDER_MODE_FOR_DISPLAY
+        (qui retourne None via jnius pour les inner classes Java).
         """
         renderer = None
         try:
@@ -430,6 +457,11 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
             count    = renderer.getPageCount()
             _log("_render_on_main_thread: pageCount={}".format(count))
             images = []
+
+            # Recuperer BitmapConfig.ARGB_8888 une seule fois et logger
+            argb_config = _BitmapConfig.ARGB_8888
+            _log("_render_on_main_thread: BitmapConfig.ARGB_8888={}".format(argb_config))
+
             for i in range(count):
                 _log("_render_on_main_thread: page {}/{}".format(i + 1, count))
                 page = renderer.openPage(i)
@@ -437,12 +469,15 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
                     scale  = dpi / 72.0
                     w = max(1, int(page.getWidth()  * scale))
                     h = max(1, int(page.getHeight() * scale))
-                    bitmap = _Bitmap.createBitmap(w, h, _BitmapConfig.ARGB_8888)
+                    _log("_render_on_main_thread: bitmap {}x{} config={}".format(w, h, argb_config))
+                    bitmap = _Bitmap.createBitmap(w, h, argb_config)
                     bitmap.eraseColor(_Color_java.WHITE)
-                    page.render(bitmap, None, None,
-                                _PdfRendererPage.RENDER_MODE_FOR_DISPLAY)
+                    # PDF_RENDER_MODE_FOR_DISPLAY = 1 (constante entiere)
+                    # Ne jamais utiliser _PdfRendererPage.RENDER_MODE_FOR_DISPLAY
+                    page.render(bitmap, None, None, PDF_RENDER_MODE_FOR_DISPLAY)
                     img = _bitmap_to_pil(bitmap, w, h)
                     images.append(ensure_white_bg(img))
+                    _log("_render_on_main_thread: page {} OK".format(i + 1))
                 finally:
                     page.close()
             result.append(images)
