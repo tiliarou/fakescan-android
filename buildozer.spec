@@ -14,7 +14,9 @@ source.include_exts = py,png,jpg,jpeg,kv,atlas
 entrypoint      = main.py
 
 # ── Dependances Python ───────────────────────────────────────────────────────────
-requirements    = python3,kivy==2.3.0,pillow,plyer,pymupdf
+# pymupdf retire : pas de wheel Android disponible sur PyPI,
+# HAS_FITZ=False invariablement dans l'APK. PdfRenderer seul moteur Android.
+requirements    = python3,kivy==2.3.0,pillow,plyer
 
 # ── Android ────────────────────────────────────────────────────────────────
 android.permissions = READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,\
