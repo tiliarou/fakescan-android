@@ -2,7 +2,7 @@
 Fake Scan PDF - Android (Kivy)
 ================================
 Dependances Python :
-    pip install kivy pillow plyer
+    pip install kivy pillow plyer pymupdf
 
 Compiler en APK :
     pip install buildozer
@@ -66,6 +66,15 @@ def _log(msg):
     else:
         print("[FakeScanPDF]", msg)
 
+# -- Tentative import PyMuPDF (fitz) ---------------------------------------
+# On tente l'import sur toutes les plateformes, y compris Android.
+# Sur Android buildozer, pymupdf doit etre dans requirements du buildozer.spec.
+try:
+    import fitz
+    HAS_FITZ = True
+except ImportError:
+    HAS_FITZ = False
+
 if ANDROID:
     try:
         from jnius import autoclass
@@ -91,14 +100,8 @@ if ANDROID:
 
     except ImportError:
         HAS_JNIUS = False
-    HAS_FITZ = False
 else:
     HAS_JNIUS = False
-    try:
-        import fitz
-        HAS_FITZ = True
-    except ImportError:
-        HAS_FITZ = False
 
 
 # -------------------------------------------------------------------------
@@ -318,7 +321,7 @@ DPI_PROCESS = 250
 def _android_uri_to_seekable_file(uri_string, suffix=".pdf"):
     """
     Copie un URI ContentResolver dans un fichier temp seekable via fd POSIX.
-    PdfRenderer exige un fichier seekable : on copie dans le CacheDir.
+    Necessaire pour fitz.open() et PdfRenderer qui exigent un fichier local.
     """
     context   = _PythonActivity.mActivity
     resolver  = context.getContentResolver()
@@ -362,56 +365,75 @@ def _android_read_uri_to_bytes(uri_string):
     return b"".join(chunks)
 
 
-def _android_render_page_from_path(path, page_index, dpi):
+def _fitz_pages_from_uri(uri_string, dpi):
     """
-    Ouvre un PdfRenderer sur le fichier local, rend la page demandee,
-    ferme le renderer.
-
-    IMPORTANT : PdfRenderer prend ownership du ParcelFileDescriptor passe
-    a son constructeur et le ferme lui-meme via renderer.close().
-    On ne doit donc JAMAIS appeler pfd.close() apres renderer.close()
-    sous peine de fermer un fd deja recycle par le kernel (bug fd 63).
+    Rend toutes les pages d'un URI Android via PyMuPDF (fitz).
+    1. Copie l'URI dans un fichier tmp local.
+    2. Ouvre le fichier avec fitz.
+    3. Renvoie une liste de PIL.Image.
     """
-    _log("_android_render_page_from_path: path={} page={} dpi={}".format(path, page_index, dpi))
-    pfd      = _ParcelFileDescriptor.open(
-        _File(path), _ParcelFileDescriptor.MODE_READ_ONLY
-    )
-    renderer = _PdfRenderer(pfd)
-    # pfd est desormais sous la responsabilite de renderer
+    _log("_fitz_pages_from_uri: uri={} dpi={}".format(uri_string[:60], dpi))
+    tmp_path = _android_uri_to_seekable_file(uri_string, suffix=".pdf")
     try:
-        page   = renderer.openPage(page_index)
-        scale  = dpi / 72.0
-        width  = int(page.getWidth()  * scale)
-        height = int(page.getHeight() * scale)
-        bitmap = _Bitmap.createBitmap(width, height, _BitmapConfig.ARGB_8888)
-        canvas = _Canvas_java(bitmap)
-        canvas.drawColor(_Color_java.WHITE)
-        page.render(bitmap, None, None, _PdfRendererPage.RENDER_MODE_FOR_PRINT)
-        page.close()
-        baos = _ByteArrayOS()
-        bitmap.compress(_BitmapCompressFormat.PNG, 100, baos)
-        img = Image.open(io.BytesIO(bytes(baos.toByteArray())))
-        return ensure_white_bg(img)
+        doc = fitz.open(tmp_path)
+        mat = fitz.Matrix(dpi / 72, dpi / 72)
+        images = []
+        count = len(doc)
+        _log("_fitz_pages_from_uri: pageCount={}".format(count))
+        for i, page in enumerate(doc):
+            _log("_fitz_pages_from_uri: rendering page {}/{}".format(i + 1, count))
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            images.append(ensure_white_bg(
+                Image.frombytes("RGB", (pix.width, pix.height), pix.samples)))
+        doc.close()
+        _log("_fitz_pages_from_uri: done, {} images".format(len(images)))
+        return images
+    except Exception:
+        _log("_fitz_pages_from_uri ERROR: " + _traceback.format_exc())
+        raise
     finally:
-        renderer.close()  # ferme aussi pfd en interne — ne pas rappeler pfd.close()
+        try:
+            os.unlink(tmp_path)
+            _log("_fitz_pages_from_uri: tmp deleted")
+        except Exception as e:
+            _log("unlink tmp error: {}".format(e))
+
+
+def _fitz_page_count_from_uri(uri_string):
+    """
+    Compte les pages d'un URI Android via PyMuPDF.
+    """
+    _log("_fitz_page_count_from_uri: uri={}".format(uri_string[:60]))
+    tmp_path = _android_uri_to_seekable_file(uri_string, suffix=".pdf")
+    try:
+        doc = fitz.open(tmp_path)
+        count = len(doc)
+        doc.close()
+        _log("_fitz_page_count_from_uri: count={}".format(count))
+        return count
+    except Exception:
+        _log("_fitz_page_count_from_uri ERROR: " + _traceback.format_exc())
+        raise
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception as e:
+            _log("unlink tmp error: {}".format(e))
 
 
 def _android_pdf_all_pages_uri(uri_string, dpi):
-    """Rend toutes les pages d'un URI dans une seule instance de PdfRenderer.
-
-    - Un seul PdfRenderer pour tout le fichier (evite Invalid ID: xx).
-    - Le fichier temporaire est supprime APRES renderer.close().
     """
-    _log("_android_pdf_all_pages_uri: uri={} dpi={}".format(uri_string[:60], dpi))
+    Fallback PdfRenderer (utilise uniquement si PyMuPDF absent).
+    Rend toutes les pages d'un URI dans une seule instance de PdfRenderer.
+    """
+    _log("_android_pdf_all_pages_uri (PdfRenderer fallback): uri={} dpi={}".format(uri_string[:60], dpi))
     tmp_path = _android_uri_to_seekable_file(uri_string, suffix=".pdf")
     renderer = None
-    pfd      = None
     try:
         pfd      = _ParcelFileDescriptor.open(
             _File(tmp_path), _ParcelFileDescriptor.MODE_READ_ONLY
         )
         renderer = _PdfRenderer(pfd)
-        # renderer prend ownership de pfd — ne pas fermer pfd separement
         count = renderer.getPageCount()
         _log("_android_pdf_all_pages_uri: pageCount={}".format(count))
         images = []
@@ -438,13 +460,11 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
         _log("_android_pdf_all_pages_uri ERROR: " + _traceback.format_exc())
         raise
     finally:
-        # Fermer le renderer AVANT de supprimer le fichier
         if renderer is not None:
             try:
-                renderer.close()  # ferme aussi pfd
+                renderer.close()
             except Exception as e:
                 _log("renderer.close() error: {}".format(e))
-        # Maintenant on peut supprimer le fichier temp en securite
         try:
             os.unlink(tmp_path)
             _log("_android_pdf_all_pages_uri: tmp deleted")
@@ -453,7 +473,10 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
 
 
 def _android_pdf_page_count_uri(uri_string):
-    _log("_android_pdf_page_count_uri: uri={}".format(uri_string[:60]))
+    """
+    Fallback PdfRenderer pour compter les pages (utilise uniquement si PyMuPDF absent).
+    """
+    _log("_android_pdf_page_count_uri (PdfRenderer fallback): uri={}".format(uri_string[:60]))
     tmp_path = _android_uri_to_seekable_file(uri_string, suffix=".pdf")
     renderer = None
     try:
@@ -470,7 +493,7 @@ def _android_pdf_page_count_uri(uri_string):
     finally:
         if renderer is not None:
             try:
-                renderer.close()  # ferme pfd en interne
+                renderer.close()
             except Exception as e:
                 _log("renderer.close() error: {}".format(e))
         try:
@@ -480,7 +503,12 @@ def _android_pdf_page_count_uri(uri_string):
 
 
 def pdf_page_count(pdf_source):
-    if ANDROID and HAS_JNIUS:
+    _log("pdf_page_count: HAS_FITZ={} HAS_JNIUS={} ANDROID={}".format(HAS_FITZ, HAS_JNIUS, ANDROID))
+    if ANDROID and HAS_FITZ:
+        # Priorite PyMuPDF sur Android : stable, pas de Invalid ID
+        return _fitz_page_count_from_uri(pdf_source)
+    elif ANDROID and HAS_JNIUS:
+        # Fallback PdfRenderer si PyMuPDF absent
         return _android_pdf_page_count_uri(pdf_source)
     elif HAS_FITZ:
         doc = fitz.open(pdf_source)
@@ -491,7 +519,12 @@ def pdf_page_count(pdf_source):
 
 
 def pdf_to_pil_list(pdf_source, dpi=DPI_PROCESS):
-    if ANDROID and HAS_JNIUS:
+    _log("pdf_to_pil_list: HAS_FITZ={} HAS_JNIUS={} ANDROID={}".format(HAS_FITZ, HAS_JNIUS, ANDROID))
+    if ANDROID and HAS_FITZ:
+        # Priorite PyMuPDF sur Android
+        return _fitz_pages_from_uri(pdf_source, dpi)
+    elif ANDROID and HAS_JNIUS:
+        # Fallback PdfRenderer
         return _android_pdf_all_pages_uri(pdf_source, dpi)
     elif HAS_FITZ:
         doc    = fitz.open(pdf_source)
@@ -506,7 +539,12 @@ def pdf_to_pil_list(pdf_source, dpi=DPI_PROCESS):
 
 
 def pdf_preview_all_pages(pdf_source, dpi=DPI_PREVIEW):
-    if ANDROID and HAS_JNIUS:
+    _log("pdf_preview_all_pages: HAS_FITZ={} HAS_JNIUS={} ANDROID={}".format(HAS_FITZ, HAS_JNIUS, ANDROID))
+    if ANDROID and HAS_FITZ:
+        # Priorite PyMuPDF sur Android
+        return _fitz_pages_from_uri(pdf_source, dpi)
+    elif ANDROID and HAS_JNIUS:
+        # Fallback PdfRenderer
         return _android_pdf_all_pages_uri(pdf_source, dpi)
     elif HAS_FITZ:
         doc    = fitz.open(pdf_source)
