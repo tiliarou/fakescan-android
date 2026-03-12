@@ -18,11 +18,14 @@ Note moteur PDF Android :
     PyMuPDF (fitz) n'a pas de wheel Android sur PyPI et n'est utilise
     que sur desktop.
 
-    Regle critique pour eviter 'Invalid ID: 63' :
-    - Ne JAMAIS ouvrir deux PdfRenderer successifs sur le meme PDF.
-    - pdf_page_count() n'est PAS appele separement sur Android :
-      total_pages est deduit de len(pages) dans le callback de
-      load_pdf_preview(), qui est le seul endroit ou PdfRenderer est ouvert.
+    Regles critiques pour eviter 'Invalid ID: xx' :
+    1. Ne JAMAIS ouvrir deux PdfRenderer successifs sur le meme PDF.
+       pdf_page_count() n'est PAS appele separement sur Android :
+       total_pages est deduit de len(pages) dans le callback de
+       load_pdf_preview(), seul endroit ou PdfRenderer est ouvert.
+    2. Utiliser RENDER_MODE_FOR_DISPLAY (pas FOR_PRINT).
+       FOR_PRINT provoque un crash PDFium natif sur les PDF avec
+       objets vectoriels complexes ou polices embarquees.
 """
 
 import io
@@ -380,12 +383,14 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
     """
     Rend toutes les pages d'un URI Android avec UN SEUL PdfRenderer.
 
-    Regle critique anti-'Invalid ID: xx' :
-      - Un seul appel _android_uri_to_seekable_file -> un seul fd tmp
-      - Un seul PdfRenderer ouvert du debut a la fin
-      - PdfRenderer prend ownership du ParcelFileDescriptor :
-        NE PAS appeler pfd.close() apres renderer.close()
-      - Supprimer le fichier tmp APRES renderer.close() seulement
+    Regles critiques anti-'Invalid ID: xx' :
+      1. Un seul appel _android_uri_to_seekable_file -> un seul fd tmp
+      2. Un seul PdfRenderer ouvert du debut a la fin
+      3. PdfRenderer prend ownership du ParcelFileDescriptor :
+         NE PAS appeler pfd.close() apres renderer.close()
+      4. Utiliser RENDER_MODE_FOR_DISPLAY (pas FOR_PRINT) :
+         FOR_PRINT crash PDFium sur PDF complexes (vecteurs, polices)
+      5. Supprimer le fichier tmp APRES renderer.close() seulement
     """
     _log("_android_pdf_all_pages_uri: uri={} dpi={}".format(uri_string[:60], dpi))
     tmp_path = _android_uri_to_seekable_file(uri_string, suffix=".pdf")
@@ -409,7 +414,9 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
                 bitmap = _Bitmap.createBitmap(width, height, _BitmapConfig.ARGB_8888)
                 canvas = _Canvas_java(bitmap)
                 canvas.drawColor(_Color_java.WHITE)
-                page.render(bitmap, None, None, _PdfRendererPage.RENDER_MODE_FOR_PRINT)
+                # FOR_DISPLAY : rendu GPU, stable sur tous les PDF
+                # FOR_PRINT causait 'Invalid ID: xx' sur PDF complexes
+                page.render(bitmap, None, None, _PdfRendererPage.RENDER_MODE_FOR_DISPLAY)
             finally:
                 page.close()
             baos = _ByteArrayOS()
@@ -1069,13 +1076,11 @@ class MainScreen(Screen):
         self.pdf_label.color = (0.10, 0.14, 0.55, 1)
         self.btn_picker.disabled = False
         if not ANDROID and HAS_FITZ:
-            # Desktop : pas de risque de recycler un fd, on peut compter ici
             try:
                 app.total_pages = pdf_page_count(source)
             except Exception:
                 app.total_pages = 999
         else:
-            # Android : total_pages mis a jour dans load_pdf_preview._done
             app.total_pages = 999
         self.refresh_zones_label()
 
