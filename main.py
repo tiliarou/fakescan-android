@@ -21,8 +21,8 @@ Note moteur PDF Android :
     Regles critiques pour eviter crash PDFium natif :
     1. PdfRenderer EXIGE d'etre execute sur un thread avec Looper Android.
        TOUTE interaction doit passer par Clock.schedule_once().
-    2. page.render() DOIT recevoir des null Java EXPLICITES via cast()
-       pour destClip et transform. None Python -> jobject invalide.
+    2. page.render() : NE PAS utiliser cast(type, None) -> SIGSEGV sur
+       certains firmwares. Passer de vrais objets Rect et Matrix Java.
     3. Un seul PdfRenderer par fichier, du debut a la fin.
     4. RENDER_MODE_FOR_DISPLAY = 1 (entier, pas l'attribut jnius).
     5. BITMAP_ARGB_8888 = 4 (entier brut, pas jnius) pour createBitmap.
@@ -99,7 +99,7 @@ BITMAP_ARGB_8888 = 4
 
 if ANDROID:
     try:
-        from jnius import autoclass, cast
+        from jnius import autoclass
         HAS_JNIUS = True
 
         _PythonActivity       = autoclass("org.kivy.android.PythonActivity")
@@ -116,6 +116,8 @@ if ANDROID:
         _JavaString           = autoclass("java.lang.String")
         _Environment          = autoclass("android.os.Environment")
         _File                 = autoclass("java.io.File")
+        _Rect                 = autoclass("android.graphics.Rect")
+        _Matrix               = autoclass("android.graphics.Matrix")
 
         _log("INIT: BITMAP_ARGB_8888={} (valeur fixe, pas jnius)".format(BITMAP_ARGB_8888))
 
@@ -335,17 +337,11 @@ def parse_pages(text, total_pages):
 # PDF HELPERS
 # -------------------------------------------------------------------------
 
-# DPI reduit a 72 pour la preview (= taille native PDF, 0 upscale)
-# => Bitmap minimal, elimine tout risque OOM sur le premier rendu
 DPI_PREVIEW = 72
 DPI_PROCESS = 250
 
 
 def _android_uri_to_seekable_file(uri_string, suffix=".pdf"):
-    """
-    Copie un URI ContentResolver dans un fichier temp seekable via fd POSIX.
-    PdfRenderer exige un fichier local seekable.
-    """
     context   = _PythonActivity.mActivity
     resolver  = context.getContentResolver()
     uri       = _Uri.parse(uri_string)
@@ -386,9 +382,6 @@ def _android_read_uri_to_bytes(uri_string):
 
 
 def _bitmap_to_pil(bitmap):
-    """
-    Convertit un Bitmap Android ARGB_8888 en PIL.Image RGB via PNG compress.
-    """
     _log("_bitmap_to_pil: START compress")
     baos = _ByteArrayOS()
     bitmap.compress(_BitmapCompressFormat.PNG, 100, baos)
@@ -403,15 +396,12 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
     """
     Rend toutes les pages d'un PDF Android en liste PIL.Image.
 
-    Architecture : tout PdfRenderer tourne sur le main thread (Looper OK)
-    via Clock.schedule_once(). Le thread daemon attend via threading.Event.
-
-    Points critiques :
-    - cast('android.graphics.Rect', None) / cast('android.graphics.Matrix', None)
-      pour les null Java de page.render().
-    - BITMAP_ARGB_8888 = 4 (entier brut, evite jobject jnius corrompu).
-    - PDF_RENDER_MODE_FOR_DISPLAY = 1 (entier brut).
-    - DPI_PREVIEW = 72 (taille native, bitmap minimal).
+    FIX CRITIQUE : cast('android.graphics.Rect', None) et
+    cast('android.graphics.Matrix', None) provoquent un SIGSEGV natif
+    dans jnius sur certains firmwares.
+    Solution : instancier de vrais objets Rect (pleine page) et Matrix
+    (identite) Java, qui sont parfaitement equivalents aux null optionnels
+    de l'API page.render() et ne touchent pas au pointeur nul JNI.
     """
     _log("_android_pdf_all_pages_uri: uri={} dpi={}".format(uri_string[:60], dpi))
 
@@ -433,11 +423,6 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
             _log("RENDER: pageCount={}".format(count))
             images = []
 
-            null_rect   = cast("android.graphics.Rect",   None)
-            null_matrix = cast("android.graphics.Matrix", None)
-            _log("RENDER: null_rect={} null_matrix={}".format(
-                type(null_rect).__name__, type(null_matrix).__name__))
-
             for i in range(count):
                 _log("RENDER: --- page {}/{} START ---".format(i + 1, count))
 
@@ -451,17 +436,24 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
                     h = max(1, int(page.getHeight() * scale))
                     _log("RENDER: page dims={}x{} (dpi={}, scale={:.2f})".format(w, h, dpi, scale))
 
+                    # FIX : vrais objets Java au lieu de cast(type, None)
+                    # Rect pleine page (0,0,w,h) = equivalent au null destClip
+                    dest_rect = _Rect(0, 0, w, h)
+                    # Matrix identite = equivalent au null transform
+                    identity  = _Matrix()
+                    _log("RENDER: dest_rect={}x{} identity=Matrix()".format(w, h))
+
                     _log("RENDER: calling Bitmap.createBitmap({}, {}, {})".format(w, h, BITMAP_ARGB_8888))
                     bitmap = _Bitmap.createBitmap(w, h, BITMAP_ARGB_8888)
-                    _log("RENDER: createBitmap OK bitmap={}".format(type(bitmap).__name__))
+                    _log("RENDER: createBitmap OK")
 
                     _log("RENDER: calling eraseColor(WHITE)")
                     bitmap.eraseColor(_Color_java.WHITE)
                     _log("RENDER: eraseColor OK")
 
-                    _log("RENDER: calling page.render(bitmap, null_rect, null_matrix, {})".format(
+                    _log("RENDER: calling page.render(bitmap, dest_rect, identity, {})".format(
                         PDF_RENDER_MODE_FOR_DISPLAY))
-                    page.render(bitmap, null_rect, null_matrix, PDF_RENDER_MODE_FOR_DISPLAY)
+                    page.render(bitmap, dest_rect, identity, PDF_RENDER_MODE_FOR_DISPLAY)
                     _log("RENDER: page.render OK")
 
                     img = _bitmap_to_pil(bitmap)
@@ -509,7 +501,6 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
 
 
 def pdf_page_count(pdf_source):
-    """Compte les pages. Utilise uniquement sur desktop (fitz)."""
     if HAS_FITZ:
         doc = fitz.open(pdf_source)
         n = len(doc)
