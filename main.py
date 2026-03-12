@@ -18,22 +18,17 @@ Note moteur PDF Android :
     PyMuPDF (fitz) n'a pas de wheel Android sur PyPI et n'est utilise
     que sur desktop.
 
-    Regles critiques pour eviter 'Invalid ID: xx' :
-    1. PdfRenderer (PDFium natif) EXIGE d'etre execute sur un thread
-       ayant un Looper Android. Les threads Python daemon n'en ont pas.
-       TOUTE interaction avec PdfRenderer doit passer par
-       Clock.schedule_once() -> execution sur le main thread Kivy/Android.
-    2. page.render() DOIT recevoir des null Java EXPLICITES (cast via
-       jnius cast()) pour destClip et transform, PAS None Python.
-       None Python est converti en jobject invalide par jnius sur certains
-       firmwares, ce qui provoque "Invalid ID: 63" dans PDFium natif.
+    Regles critiques pour eviter crash PDFium natif :
+    1. PdfRenderer EXIGE d'etre execute sur un thread avec Looper Android.
+       TOUTE interaction doit passer par Clock.schedule_once().
+    2. page.render() DOIT recevoir des null Java EXPLICITES via cast()
+       pour destClip et transform. None Python -> jobject invalide.
     3. Un seul PdfRenderer par fichier, du debut a la fin.
-    4. RENDER_MODE_FOR_DISPLAY = 1 (constante entiere, NE PAS utiliser
-       _PdfRendererPage.RENDER_MODE_FOR_DISPLAY qui retourne None via
-       jnius sur certains appareils Android).
-    5. BitmapConfig : utiliser autoclass("android.graphics.Bitmap$Config")
-       et acceder a ARGB_8888 via cet objet. Logger sa valeur au demarrage
-       pour detecter toute regression.
+    4. RENDER_MODE_FOR_DISPLAY = 1 (entier, pas l'attribut jnius).
+    5. BitmapConfig.ARGB_8888 via jnius retourne un jobject corrompu
+       sur certains firmwares -> SIGSEGV dans PDFium.
+       SOLUTION : passer directement l'entier 4 (valeur Android stable
+       depuis API 1, jamais changee) a Bitmap.createBitmap().
 """
 
 import io
@@ -97,10 +92,14 @@ else:
 
 # -- jnius / PdfRenderer : Android uniquement ------------------------------
 # RENDER_MODE_FOR_DISPLAY = 1 en dur (constante Android stable depuis API 21).
-# NE PAS utiliser _PdfRendererPage.RENDER_MODE_FOR_DISPLAY : jnius retourne
-# None pour les champs statiques des classes internes ($Page) sur certains
-# appareils/versions, ce qui provoque "Invalid ID: 63" dans PDFium natif.
 PDF_RENDER_MODE_FOR_DISPLAY = 1
+
+# BITMAP_ARGB_8888 = 4 en dur.
+# android.graphics.Bitmap$Config.ARGB_8888 via jnius retourne un jobject
+# corrompu sur certains firmwares, ce qui provoque un SIGSEGV dans PDFium
+# natif au moment de Bitmap.createBitmap(). La valeur entiere 4 correspond
+# a ARGB_8888 depuis Android API 1 et n'a jamais change.
+BITMAP_ARGB_8888 = 4
 
 if ANDROID:
     try:
@@ -112,7 +111,6 @@ if ANDROID:
         _ParcelFileDescriptor = autoclass("android.os.ParcelFileDescriptor")
         _PdfRenderer          = autoclass("android.graphics.pdf.PdfRenderer")
         _Bitmap               = autoclass("android.graphics.Bitmap")
-        _BitmapConfig         = autoclass("android.graphics.Bitmap$Config")
         _BitmapCompressFormat = autoclass("android.graphics.Bitmap$CompressFormat")
         _ByteArrayOS          = autoclass("java.io.ByteArrayOutputStream")
         _Color_java           = autoclass("android.graphics.Color")
@@ -122,16 +120,8 @@ if ANDROID:
         _JavaString           = autoclass("java.lang.String")
         _Environment          = autoclass("android.os.Environment")
         _File                 = autoclass("java.io.File")
-        # Classes necessaires pour passer des null Java types a page.render()
-        _Rect                 = autoclass("android.graphics.Rect")
-        _Matrix               = autoclass("android.graphics.Matrix")
 
-        # Log de diagnostic au demarrage pour detecter tout probleme jnius
-        try:
-            _argb8888 = _BitmapConfig.ARGB_8888
-            _log("INIT: BitmapConfig.ARGB_8888={}".format(_argb8888))
-        except Exception as _e:
-            _log("INIT: BitmapConfig.ARGB_8888 inaccessible: {}".format(_e))
+        _log("INIT: BITMAP_ARGB_8888={} (valeur fixe, pas jnius)".format(BITMAP_ARGB_8888))
 
     except ImportError:
         HAS_JNIUS = False
@@ -357,7 +347,6 @@ def _android_uri_to_seekable_file(uri_string, suffix=".pdf"):
     """
     Copie un URI ContentResolver dans un fichier temp seekable via fd POSIX.
     PdfRenderer exige un fichier local seekable.
-    IMPORTANT : appeler cette fonction UNE SEULE FOIS par session PDF.
     """
     context   = _PythonActivity.mActivity
     resolver  = context.getContentResolver()
@@ -401,11 +390,9 @@ def _android_read_uri_to_bytes(uri_string):
     return b"".join(chunks)
 
 
-def _bitmap_to_pil(bitmap, width, height):
+def _bitmap_to_pil(bitmap):
     """
-    Convertit un Bitmap Android ARGB_8888 en PIL.Image RGB.
-    Utilise compress PNG -> ByteArrayOutputStream pour eviter
-    tout acces natif memoire direct (unsafe).
+    Convertit un Bitmap Android ARGB_8888 en PIL.Image RGB via PNG compress.
     """
     baos = _ByteArrayOS()
     bitmap.compress(_BitmapCompressFormat.PNG, 100, baos)
@@ -416,54 +403,23 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
     """
     Rend toutes les pages d'un PDF Android en liste PIL.Image.
 
-    ARCHITECTURE CLEE :
-    PdfRenderer (PDFium natif) exige un thread avec Looper Android.
-    Les threads Python daemon n'ont PAS de Looper -> 'Invalid ID: xx'.
+    Architecture : tout PdfRenderer tourne sur le main thread (Looper OK)
+    via Clock.schedule_once(). Le thread daemon attend via threading.Event.
 
-    Solution : tout le travail PdfRenderer est dispatch sur le main
-    thread via Clock.schedule_once(). Le thread appelant (daemon)
-    attend la completion via threading.Event.
-
-    CORRECTIF PRINCIPAL (Invalid ID: 63) :
-    page.render() DOIT recevoir des null Java EXPLICITEMENT TYPES via
-    cast(). Passer None Python est converti en jobject invalide par
-    jnius sur certains firmwares, ce qui fait rejeter le bitmap par
-    PDFium avec "Invalid ID: 63".
-
-    Signature Java :
-      render(Bitmap dest, Rect destClip, Matrix transform, int renderMode)
-
-    Appel correct :
-      page.render(bitmap,
-                  cast('android.graphics.Rect', None),
-                  cast('android.graphics.Matrix', None),
-                  PDF_RENDER_MODE_FOR_DISPLAY)
-
-    Schema :
-      thread daemon  ──Clock.schedule_once──>  main thread (Looper OK)
-          |                                        |
-          |  event.wait()  <── event.set() ────  rendu complet
-          |                                        |
-       recoit images PIL                      (ou exception)
+    Points critiques :
+    - cast('android.graphics.Rect', None) et cast('android.graphics.Matrix', None)
+      pour les parametres optionnels de page.render() (pas None Python).
+    - BITMAP_ARGB_8888 = 4 (entier, pas jnius) pour Bitmap.createBitmap().
+    - PDF_RENDER_MODE_FOR_DISPLAY = 1 (entier, pas l'attribut jnius).
     """
     _log("_android_pdf_all_pages_uri: uri={} dpi={}".format(uri_string[:60], dpi))
 
-    # Copie de l'URI en fichier local (peut se faire hors main thread)
     tmp_path = _android_uri_to_seekable_file(uri_string, suffix=".pdf")
 
-    result = []       # result[0] = liste d'images ou Exception
+    result = []
     event  = threading.Event()
 
     def _render_on_main_thread(dt):
-        """
-        Executee sur le main thread Android (Looper present).
-        Ouvre PdfRenderer, rend toutes les pages, ferme tout.
-
-        CRITIQUE : cast('android.graphics.Rect', None) et
-        cast('android.graphics.Matrix', None) produisent des null Java
-        correctement types, contrairement a None Python qui provoque
-        "Invalid ID: 63" sur PDFium natif.
-        """
         renderer = None
         try:
             pfd      = _ParcelFileDescriptor.open(
@@ -474,31 +430,23 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
             _log("_render_on_main_thread: pageCount={}".format(count))
             images = []
 
-            # Recuperer BitmapConfig.ARGB_8888 une seule fois et logger
-            argb_config = _BitmapConfig.ARGB_8888
-            _log("_render_on_main_thread: BitmapConfig.ARGB_8888={}".format(argb_config))
-
-            # Null Java explicitement types pour destClip et transform
-            # OBLIGATOIRE : None Python -> jobject invalide -> Invalid ID: 63
+            # null Java types pour destClip et transform
             null_rect   = cast("android.graphics.Rect",   None)
             null_matrix = cast("android.graphics.Matrix", None)
-            _log("_render_on_main_thread: null_rect={} null_matrix={}".format(
-                null_rect, null_matrix))
 
             for i in range(count):
                 _log("_render_on_main_thread: page {}/{}".format(i + 1, count))
                 page = renderer.openPage(i)
                 try:
-                    scale  = dpi / 72.0
+                    scale = dpi / 72.0
                     w = max(1, int(page.getWidth()  * scale))
                     h = max(1, int(page.getHeight() * scale))
-                    _log("_render_on_main_thread: bitmap {}x{} config={}".format(w, h, argb_config))
-                    bitmap = _Bitmap.createBitmap(w, h, argb_config)
+                    _log("_render_on_main_thread: bitmap {}x{} config=ARGB_8888(4)".format(w, h))
+                    # BITMAP_ARGB_8888 = 4 (entier brut, evite le jobject jnius corrompu)
+                    bitmap = _Bitmap.createBitmap(w, h, BITMAP_ARGB_8888)
                     bitmap.eraseColor(_Color_java.WHITE)
-                    # cast() produit un null Java type correct
-                    # PDF_RENDER_MODE_FOR_DISPLAY = 1 (constante entiere)
                     page.render(bitmap, null_rect, null_matrix, PDF_RENDER_MODE_FOR_DISPLAY)
-                    img = _bitmap_to_pil(bitmap, w, h)
+                    img = _bitmap_to_pil(bitmap)
                     images.append(ensure_white_bg(img))
                     _log("_render_on_main_thread: page {} OK".format(i + 1))
                 finally:
@@ -521,13 +469,11 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
                 _log("unlink tmp error: {}".format(e))
             event.set()
 
-    # Dispatch sur le main thread et attente (timeout 60s par securite)
     Clock.schedule_once(_render_on_main_thread, 0)
     finished = event.wait(timeout=60)
 
     if not finished:
         raise RuntimeError("Timeout: PdfRenderer n'a pas repondu en 60s")
-
     if not result:
         raise RuntimeError("PdfRenderer: aucun resultat recu")
 
@@ -537,8 +483,6 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
     return outcome
 
 
-# pdf_page_count N'EST PAS APPELE SUR ANDROID.
-# Sur Android, total_pages est deduit de len(pages) apres load_pdf_preview.
 def pdf_page_count(pdf_source):
     """Compte les pages. Utilise uniquement sur desktop (fitz)."""
     if HAS_FITZ:
@@ -849,8 +793,7 @@ class PickerScreen(Screen):
     def load_pdf_preview(self, pdf_source):
         """
         Lance le chargement de la preview dans un thread daemon.
-        Le rendu PdfRenderer est automatiquement dispatch sur le
-        main thread via _android_pdf_all_pages_uri -> Clock.schedule_once.
+        Le rendu PdfRenderer est dispatch sur le main thread via Clock.
         """
         self.status_lbl.text = "Chargement des pages..."
         self.picker.pages = []
@@ -1150,12 +1093,6 @@ class MainScreen(Screen):
         open_file_picker(self._on_pdf_selected, mime_type="application/pdf")
 
     def _on_pdf_selected(self, source):
-        """
-        Enregistre le chemin du PDF et active le bouton picker.
-        NE PAS appeler pdf_page_count() ici sur Android.
-        total_pages sera mis a jour dans load_pdf_preview._done.
-        Sur desktop (HAS_FITZ=True), pdf_page_count() est sans risque.
-        """
         app = App.get_running_app()
         app.pdf_path    = source
         app.parafe_rect = None
