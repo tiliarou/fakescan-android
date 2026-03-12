@@ -23,8 +23,10 @@ Note moteur PDF Android :
        ayant un Looper Android. Les threads Python daemon n'en ont pas.
        TOUTE interaction avec PdfRenderer doit passer par
        Clock.schedule_once() -> execution sur le main thread Kivy/Android.
-    2. NE PAS creer de Canvas Java avant page.render() :
-       On utilise bitmap.eraseColor(Color.WHITE) a la place.
+    2. page.render() DOIT recevoir des null Java EXPLICITES (cast via
+       jnius cast()) pour destClip et transform, PAS None Python.
+       None Python est converti en jobject invalide par jnius sur certains
+       firmwares, ce qui provoque "Invalid ID: 63" dans PDFium natif.
     3. Un seul PdfRenderer par fichier, du debut a la fin.
     4. RENDER_MODE_FOR_DISPLAY = 1 (constante entiere, NE PAS utiliser
        _PdfRendererPage.RENDER_MODE_FOR_DISPLAY qui retourne None via
@@ -102,7 +104,7 @@ PDF_RENDER_MODE_FOR_DISPLAY = 1
 
 if ANDROID:
     try:
-        from jnius import autoclass
+        from jnius import autoclass, cast
         HAS_JNIUS = True
 
         _PythonActivity       = autoclass("org.kivy.android.PythonActivity")
@@ -120,6 +122,9 @@ if ANDROID:
         _JavaString           = autoclass("java.lang.String")
         _Environment          = autoclass("android.os.Environment")
         _File                 = autoclass("java.io.File")
+        # Classes necessaires pour passer des null Java types a page.render()
+        _Rect                 = autoclass("android.graphics.Rect")
+        _Matrix               = autoclass("android.graphics.Matrix")
 
         # Log de diagnostic au demarrage pour detecter tout probleme jnius
         try:
@@ -419,10 +424,20 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
     thread via Clock.schedule_once(). Le thread appelant (daemon)
     attend la completion via threading.Event.
 
-    CORRECTIF PRINCIPAL :
-    page.render() recoit PDF_RENDER_MODE_FOR_DISPLAY = 1 (entier Python),
-    PAS _PdfRendererPage.RENDER_MODE_FOR_DISPLAY qui vaut None via jnius
-    sur les classes internes Android$InnerClass.
+    CORRECTIF PRINCIPAL (Invalid ID: 63) :
+    page.render() DOIT recevoir des null Java EXPLICITEMENT TYPES via
+    cast(). Passer None Python est converti en jobject invalide par
+    jnius sur certains firmwares, ce qui fait rejeter le bitmap par
+    PDFium avec "Invalid ID: 63".
+
+    Signature Java :
+      render(Bitmap dest, Rect destClip, Matrix transform, int renderMode)
+
+    Appel correct :
+      page.render(bitmap,
+                  cast('android.graphics.Rect', None),
+                  cast('android.graphics.Matrix', None),
+                  PDF_RENDER_MODE_FOR_DISPLAY)
 
     Schema :
       thread daemon  ──Clock.schedule_once──>  main thread (Looper OK)
@@ -444,9 +459,10 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
         Executee sur le main thread Android (Looper present).
         Ouvre PdfRenderer, rend toutes les pages, ferme tout.
 
-        IMPORTANT : on passe PDF_RENDER_MODE_FOR_DISPLAY (int=1) directement
-        a page.render() et non _PdfRendererPage.RENDER_MODE_FOR_DISPLAY
-        (qui retourne None via jnius pour les inner classes Java).
+        CRITIQUE : cast('android.graphics.Rect', None) et
+        cast('android.graphics.Matrix', None) produisent des null Java
+        correctement types, contrairement a None Python qui provoque
+        "Invalid ID: 63" sur PDFium natif.
         """
         renderer = None
         try:
@@ -462,6 +478,13 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
             argb_config = _BitmapConfig.ARGB_8888
             _log("_render_on_main_thread: BitmapConfig.ARGB_8888={}".format(argb_config))
 
+            # Null Java explicitement types pour destClip et transform
+            # OBLIGATOIRE : None Python -> jobject invalide -> Invalid ID: 63
+            null_rect   = cast("android.graphics.Rect",   None)
+            null_matrix = cast("android.graphics.Matrix", None)
+            _log("_render_on_main_thread: null_rect={} null_matrix={}".format(
+                null_rect, null_matrix))
+
             for i in range(count):
                 _log("_render_on_main_thread: page {}/{}".format(i + 1, count))
                 page = renderer.openPage(i)
@@ -472,9 +495,9 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
                     _log("_render_on_main_thread: bitmap {}x{} config={}".format(w, h, argb_config))
                     bitmap = _Bitmap.createBitmap(w, h, argb_config)
                     bitmap.eraseColor(_Color_java.WHITE)
+                    # cast() produit un null Java type correct
                     # PDF_RENDER_MODE_FOR_DISPLAY = 1 (constante entiere)
-                    # Ne jamais utiliser _PdfRendererPage.RENDER_MODE_FOR_DISPLAY
-                    page.render(bitmap, None, None, PDF_RENDER_MODE_FOR_DISPLAY)
+                    page.render(bitmap, null_rect, null_matrix, PDF_RENDER_MODE_FOR_DISPLAY)
                     img = _bitmap_to_pil(bitmap, w, h)
                     images.append(ensure_white_bg(img))
                     _log("_render_on_main_thread: page {} OK".format(i + 1))
