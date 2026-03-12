@@ -375,21 +375,43 @@ def _android_render_page_from_path(path, page_index, dpi):
 
 
 def _android_pdf_all_pages_uri(uri_string, dpi):
+    """Rend toutes les pages d'un URI dans une seule instance de PdfRenderer.
+
+    Cette version ouvre une seule fois le fichier et itere sur les pages,
+    ce qui est plus robuste que d'ouvrir/fermer un PdfRenderer par page
+    (certaines implémentations de PdfRenderer n'aiment pas les ouvertures
+    répétées en rafale et finissent par lever des erreurs du type
+    "Invalid ID: xx").
+    """
     tmp_path = _android_uri_to_seekable_file(uri_string, suffix=".pdf")
     try:
-        # Ouvre une premiere fois juste pour connaitre le nombre de pages
-        pfd_count = _ParcelFileDescriptor.open(
+        pfd      = _ParcelFileDescriptor.open(
             _File(tmp_path), _ParcelFileDescriptor.MODE_READ_ONLY
         )
-        renderer_count = _PdfRenderer(pfd_count)
-        count = renderer_count.getPageCount()
-        renderer_count.close()  # ferme pfd_count en interne
-
-        images = []
-        for i in range(count):
-            # Chaque appel ouvre+ferme son propre renderer+pfd
-            images.append(_android_render_page_from_path(tmp_path, i, dpi))
-        return images
+        renderer = _PdfRenderer(pfd)
+        # renderer prend ownership de pfd
+        try:
+            count  = renderer.getPageCount()
+            images = []
+            for i in range(count):
+                page = renderer.openPage(i)
+                try:
+                    scale  = dpi / 72.0
+                    width  = int(page.getWidth()  * scale)
+                    height = int(page.getHeight() * scale)
+                    bitmap = _Bitmap.createBitmap(width, height, _BitmapConfig.ARGB_8888)
+                    canvas = _Canvas_java(bitmap)
+                    canvas.drawColor(_Color_java.WHITE)
+                    page.render(bitmap, None, None, _PdfRendererPage.RENDER_MODE_FOR_PRINT)
+                finally:
+                    page.close()
+                baos = _ByteArrayOS()
+                bitmap.compress(_BitmapCompressFormat.PNG, 100, baos)
+                img = Image.open(io.BytesIO(bytes(baos.toByteArray())))
+                images.append(ensure_white_bg(img))
+            return images
+        finally:
+            renderer.close()  # ferme aussi pfd
     finally:
         try:
             os.unlink(tmp_path)
