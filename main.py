@@ -25,7 +25,9 @@ Note moteur PDF Android :
        certains firmwares. Passer de vrais objets Rect et Matrix Java.
     3. Un seul PdfRenderer par fichier, du debut a la fin.
     4. RENDER_MODE_FOR_DISPLAY = 1 (entier, pas l'attribut jnius).
-    5. BITMAP_ARGB_8888 = 4 (entier brut, pas jnius) pour createBitmap.
+    5. Bitmap.createBitmap() exige un objet Bitmap$Config Java, PAS un
+       entier brut -> utiliser _BitmapConfig.ARGB_8888.
+    6. page.close() doit etre appele APRES page.render(), jamais avant.
 """
 
 import io
@@ -88,14 +90,7 @@ else:
     HAS_FITZ = False
 
 # -- jnius / PdfRenderer : Android uniquement ------------------------------
-# RENDER_MODE_FOR_DISPLAY = 1 en dur (constante Android stable depuis API 21).
 PDF_RENDER_MODE_FOR_DISPLAY = 1
-
-# BITMAP_ARGB_8888 = 4 en dur.
-# android.graphics.Bitmap$Config.ARGB_8888 via jnius retourne un jobject
-# corrompu sur certains firmwares -> SIGSEGV dans PDFium natif.
-# La valeur entiere 4 = ARGB_8888 depuis Android API 1, jamais changee.
-BITMAP_ARGB_8888 = 4
 
 if ANDROID:
     try:
@@ -107,6 +102,7 @@ if ANDROID:
         _ParcelFileDescriptor = autoclass("android.os.ParcelFileDescriptor")
         _PdfRenderer          = autoclass("android.graphics.pdf.PdfRenderer")
         _Bitmap               = autoclass("android.graphics.Bitmap")
+        _BitmapConfig         = autoclass("android.graphics.Bitmap$Config")
         _BitmapCompressFormat = autoclass("android.graphics.Bitmap$CompressFormat")
         _ByteArrayOS          = autoclass("java.io.ByteArrayOutputStream")
         _Color_java           = autoclass("android.graphics.Color")
@@ -119,7 +115,7 @@ if ANDROID:
         _Rect                 = autoclass("android.graphics.Rect")
         _Matrix               = autoclass("android.graphics.Matrix")
 
-        _log("INIT: BITMAP_ARGB_8888={} (valeur fixe, pas jnius)".format(BITMAP_ARGB_8888))
+        _log("INIT: BitmapConfig.ARGB_8888={}".format(_BitmapConfig.ARGB_8888))
 
     except ImportError:
         HAS_JNIUS = False
@@ -396,12 +392,11 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
     """
     Rend toutes les pages d'un PDF Android en liste PIL.Image.
 
-    FIX CRITIQUE : cast('android.graphics.Rect', None) et
-    cast('android.graphics.Matrix', None) provoquent un SIGSEGV natif
-    dans jnius sur certains firmwares.
-    Solution : instancier de vrais objets Rect (pleine page) et Matrix
-    (identite) Java, qui sont parfaitement equivalents aux null optionnels
-    de l'API page.render() et ne touchent pas au pointeur nul JNI.
+    FIX 1 : cast(type, None) -> SIGSEGV. Utilise _Rect et _Matrix reels.
+    FIX 2 : Bitmap.createBitmap(w, h, int) inexistant en JNI.
+            Il faut passer _BitmapConfig.ARGB_8888 (objet Java enum).
+    FIX 3 : page.close() doit etre dans le finally APRES render,
+            pas avant createBitmap.
     """
     _log("_android_pdf_all_pages_uri: uri={} dpi={}".format(uri_string[:60], dpi))
 
@@ -425,26 +420,27 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
 
             for i in range(count):
                 _log("RENDER: --- page {}/{} START ---".format(i + 1, count))
-
-                _log("RENDER: calling renderer.openPage({})".format(i))
-                page = renderer.openPage(i)
-                _log("RENDER: openPage OK")
-
+                page = None
                 try:
+                    _log("RENDER: calling renderer.openPage({})".format(i))
+                    page = renderer.openPage(i)
+                    _log("RENDER: openPage OK")
+
                     scale = dpi / 72.0
                     w = max(1, int(page.getWidth()  * scale))
                     h = max(1, int(page.getHeight() * scale))
                     _log("RENDER: page dims={}x{} (dpi={}, scale={:.2f})".format(w, h, dpi, scale))
 
-                    # FIX : vrais objets Java au lieu de cast(type, None)
-                    # Rect pleine page (0,0,w,h) = equivalent au null destClip
+                    # Vrais objets Java (pas de cast None -> SIGSEGV)
                     dest_rect = _Rect(0, 0, w, h)
-                    # Matrix identite = equivalent au null transform
                     identity  = _Matrix()
                     _log("RENDER: dest_rect={}x{} identity=Matrix()".format(w, h))
 
-                    _log("RENDER: calling Bitmap.createBitmap({}, {}, {})".format(w, h, BITMAP_ARGB_8888))
-                    bitmap = _Bitmap.createBitmap(w, h, BITMAP_ARGB_8888)
+                    # FIX : passer _BitmapConfig.ARGB_8888 (objet Java)
+                    # et non l'entier 4 -> JavaException no matching overload
+                    config = _BitmapConfig.ARGB_8888
+                    _log("RENDER: calling Bitmap.createBitmap({}, {}, ARGB_8888)".format(w, h))
+                    bitmap = _Bitmap.createBitmap(w, h, config)
                     _log("RENDER: createBitmap OK")
 
                     _log("RENDER: calling eraseColor(WHITE)")
@@ -461,9 +457,13 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
                     _log("RENDER: page {} DONE".format(i + 1))
 
                 finally:
-                    _log("RENDER: closing page {}".format(i))
-                    page.close()
-                    _log("RENDER: page {} closed".format(i))
+                    # FIX : page.close() APRES render, pas avant
+                    if page is not None:
+                        try:
+                            page.close()
+                            _log("RENDER: page {} closed".format(i))
+                        except Exception as e:
+                            _log("RENDER: page.close() error: {}".format(e))
 
             result.append(images)
             _log("RENDER: ALL DONE, {} images".format(len(images)))
