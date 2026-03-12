@@ -19,15 +19,13 @@ Note moteur PDF Android :
     que sur desktop.
 
     Regles critiques pour eviter 'Invalid ID: xx' :
-    1. Ne JAMAIS ouvrir deux PdfRenderer successifs sur le meme PDF.
-       pdf_page_count() n'est PAS appele separement sur Android :
-       total_pages est deduit de len(pages) dans le callback de
-       load_pdf_preview(), seul endroit ou PdfRenderer est ouvert.
+    1. PdfRenderer (PDFium natif) EXIGE d'etre execute sur un thread
+       ayant un Looper Android. Les threads Python daemon n'en ont pas.
+       TOUTE interaction avec PdfRenderer doit passer par
+       Clock.schedule_once() -> execution sur le main thread Kivy/Android.
     2. NE PAS creer de Canvas Java avant page.render() :
-       Canvas(bitmap) + drawColor() avant render() provoque
-       'Invalid ID: xx' sur les PDF complexes (PDFium natif).
        On utilise bitmap.eraseColor(Color.WHITE) a la place.
-    3. Fallback DPI : si render() echoue, on retente a DPI/2 puis DPI/4.
+    3. Un seul PdfRenderer par fichier, du debut a la fin.
 """
 
 import io
@@ -105,8 +103,6 @@ if ANDROID:
         _BitmapCompressFormat = autoclass("android.graphics.Bitmap$CompressFormat")
         _ByteArrayOS          = autoclass("java.io.ByteArrayOutputStream")
         _Color_java           = autoclass("android.graphics.Color")
-        # _Canvas_java supprime : son usage avant page.render() causait
-        # 'Invalid ID: xx' sur PDFium natif Android
         _Intent               = autoclass("android.content.Intent")
         _ContentValues        = autoclass("android.content.ContentValues")
         _Downloads            = autoclass("android.provider.MediaStore$Downloads")
@@ -337,7 +333,7 @@ DPI_PROCESS = 250
 def _android_uri_to_seekable_file(uri_string, suffix=".pdf"):
     """
     Copie un URI ContentResolver dans un fichier temp seekable via fd POSIX.
-    PdfRenderer exige un fichier local seekable : on copie dans CacheDir.
+    PdfRenderer exige un fichier local seekable.
     IMPORTANT : appeler cette fonction UNE SEULE FOIS par session PDF.
     """
     context   = _PythonActivity.mActivity
@@ -382,103 +378,109 @@ def _android_read_uri_to_bytes(uri_string):
     return b"".join(chunks)
 
 
-def _render_page_to_pil(page, dpi):
+def _bitmap_to_pil(bitmap, width, height):
     """
-    Rend une page PdfRenderer en PIL.Image sans Canvas Java.
-
-    Raison : creer un Canvas(bitmap) puis appeler drawColor() AVANT
-    page.render() corrompt l'etat interne de PDFium natif et provoque
-    'Invalid ID: xx' (java.lang.IllegalArgumentException).
-
-    Solution : on efface le bitmap avec bitmap.eraseColor(WHITE) qui
-    est une operation purement Bitmap (pas de Canvas), puis on passe
-    directement le bitmap a page.render().
-
-    Fallback DPI : si render() echoue malgre tout (bitmap trop grand
-    pour la memoire GPU), on retente a DPI/2 puis DPI/4.
+    Convertit un Bitmap Android ARGB_8888 en PIL.Image RGB.
+    Utilise compress PNG -> ByteArrayOutputStream pour eviter
+    tout acces natif memoire direct (unsafe).
     """
-    scale  = dpi / 72.0
-    width  = int(page.getWidth()  * scale)
-    height = int(page.getHeight() * scale)
-
-    for attempt, factor in enumerate([1, 2, 4]):
-        w = max(1, width  // factor)
-        h = max(1, height // factor)
-        _log("_render_page_to_pil: attempt={} size={}x{}".format(attempt, w, h))
-        try:
-            bitmap = _Bitmap.createBitmap(w, h, _BitmapConfig.ARGB_8888)
-            # eraseColor au lieu de Canvas+drawColor : pas de contexte
-            # graphique intermediaire -> PDFium reste dans un etat valide
-            bitmap.eraseColor(_Color_java.WHITE)
-            page.render(bitmap, None, None,
-                        _PdfRendererPage.RENDER_MODE_FOR_DISPLAY)
-            baos = _ByteArrayOS()
-            bitmap.compress(_BitmapCompressFormat.PNG, 100, baos)
-            img = Image.open(io.BytesIO(bytes(baos.toByteArray())))
-            if factor > 1:
-                # Remettre a l'echelle cible apres rendu reduit
-                img = img.resize((width, height), Image.LANCZOS)
-            return img
-        except Exception as e:
-            _log("_render_page_to_pil: attempt {} failed: {}".format(attempt, e))
-            if attempt == 2:
-                raise
+    baos = _ByteArrayOS()
+    bitmap.compress(_BitmapCompressFormat.PNG, 100, baos)
+    return Image.open(io.BytesIO(bytes(baos.toByteArray())))
 
 
 def _android_pdf_all_pages_uri(uri_string, dpi):
     """
-    Rend toutes les pages d'un URI Android avec UN SEUL PdfRenderer.
+    Rend toutes les pages d'un PDF Android en liste PIL.Image.
 
-    Regles critiques anti-'Invalid ID: xx' :
-      1. Un seul appel _android_uri_to_seekable_file -> un seul fd tmp
-      2. Un seul PdfRenderer ouvert du debut a la fin
-      3. PdfRenderer prend ownership du ParcelFileDescriptor :
-         NE PAS appeler pfd.close() apres renderer.close()
-      4. NE PAS creer de Canvas Java avant page.render() :
-         utiliser bitmap.eraseColor(WHITE) + render() direct
-      5. Supprimer le fichier tmp APRES renderer.close() seulement
+    ARCHITECTURE CLEE :
+    PdfRenderer (PDFium natif) exige un thread avec Looper Android.
+    Les threads Python daemon n'ont PAS de Looper -> 'Invalid ID: xx'.
+
+    Solution : tout le travail PdfRenderer est dispatch sur le main
+    thread via Clock.schedule_once(). Le thread appelant (daemon)
+    attend la completion via threading.Event.
+
+    Schema :
+      thread daemon  ──Clock.schedule_once──>  main thread (Looper OK)
+          |                                        |
+          |  event.wait()  <── event.set() ────  rendu complet
+          |                                        |
+       recoit images PIL                      (ou exception)
     """
     _log("_android_pdf_all_pages_uri: uri={} dpi={}".format(uri_string[:60], dpi))
+
+    # Copie de l'URI en fichier local (peut se faire hors main thread)
     tmp_path = _android_uri_to_seekable_file(uri_string, suffix=".pdf")
-    renderer = None
-    try:
-        pfd      = _ParcelFileDescriptor.open(
-            _File(tmp_path), _ParcelFileDescriptor.MODE_READ_ONLY
-        )
-        renderer = _PdfRenderer(pfd)
-        count = renderer.getPageCount()
-        _log("_android_pdf_all_pages_uri: pageCount={}".format(count))
-        images = []
-        for i in range(count):
-            _log("_android_pdf_all_pages_uri: rendering page {}/{}".format(i + 1, count))
-            page = renderer.openPage(i)
-            try:
-                img = _render_page_to_pil(page, dpi)
-            finally:
-                page.close()
-            images.append(ensure_white_bg(img))
-        _log("_android_pdf_all_pages_uri: done, {} images".format(len(images)))
-        return images
-    except Exception:
-        _log("_android_pdf_all_pages_uri ERROR: " + _traceback.format_exc())
-        raise
-    finally:
-        if renderer is not None:
-            try:
-                renderer.close()
-            except Exception as e:
-                _log("renderer.close() error: {}".format(e))
+
+    result = []       # result[0] = liste d'images ou Exception
+    event  = threading.Event()
+
+    def _render_on_main_thread(dt):
+        """
+        Executee sur le main thread Android (Looper present).
+        Ouvre PdfRenderer, rend toutes les pages, ferme tout.
+        """
+        renderer = None
         try:
-            os.unlink(tmp_path)
-            _log("_android_pdf_all_pages_uri: tmp deleted")
-        except Exception as e:
-            _log("unlink tmp error: {}".format(e))
+            pfd      = _ParcelFileDescriptor.open(
+                _File(tmp_path), _ParcelFileDescriptor.MODE_READ_ONLY
+            )
+            renderer = _PdfRenderer(pfd)
+            count    = renderer.getPageCount()
+            _log("_render_on_main_thread: pageCount={}".format(count))
+            images = []
+            for i in range(count):
+                _log("_render_on_main_thread: page {}/{}".format(i + 1, count))
+                page = renderer.openPage(i)
+                try:
+                    scale  = dpi / 72.0
+                    w = max(1, int(page.getWidth()  * scale))
+                    h = max(1, int(page.getHeight() * scale))
+                    bitmap = _Bitmap.createBitmap(w, h, _BitmapConfig.ARGB_8888)
+                    bitmap.eraseColor(_Color_java.WHITE)
+                    page.render(bitmap, None, None,
+                                _PdfRendererPage.RENDER_MODE_FOR_DISPLAY)
+                    img = _bitmap_to_pil(bitmap, w, h)
+                    images.append(ensure_white_bg(img))
+                finally:
+                    page.close()
+            result.append(images)
+            _log("_render_on_main_thread: done, {} pages".format(len(images)))
+        except Exception as exc:
+            _log("_render_on_main_thread ERROR: " + _traceback.format_exc())
+            result.append(exc)
+        finally:
+            if renderer is not None:
+                try:
+                    renderer.close()
+                except Exception as e:
+                    _log("renderer.close() error: {}".format(e))
+            try:
+                os.unlink(tmp_path)
+                _log("_render_on_main_thread: tmp deleted")
+            except Exception as e:
+                _log("unlink tmp error: {}".format(e))
+            event.set()
+
+    # Dispatch sur le main thread et attente (timeout 60s par securite)
+    Clock.schedule_once(_render_on_main_thread, 0)
+    finished = event.wait(timeout=60)
+
+    if not finished:
+        raise RuntimeError("Timeout: PdfRenderer n'a pas repondu en 60s")
+
+    if not result:
+        raise RuntimeError("PdfRenderer: aucun resultat recu")
+
+    outcome = result[0]
+    if isinstance(outcome, Exception):
+        raise outcome
+    return outcome
 
 
 # pdf_page_count N'EST PAS APPELE SUR ANDROID.
 # Sur Android, total_pages est deduit de len(pages) apres load_pdf_preview.
-# L'appeler separement ouvrirait un 2e PdfRenderer/fd dont le numero
-# serait recycle par le kernel -> crash PDFium natif (Invalid ID: xx).
 def pdf_page_count(pdf_source):
     """Compte les pages. Utilise uniquement sur desktop (fitz)."""
     if HAS_FITZ:
@@ -788,9 +790,9 @@ class PickerScreen(Screen):
 
     def load_pdf_preview(self, pdf_source):
         """
-        Charge la preview du PDF ET met a jour app.total_pages.
-        C'est le SEUL endroit ou PdfRenderer est ouvert sur Android.
-        Ne jamais appeler pdf_page_count() sur Android en dehors d'ici.
+        Lance le chargement de la preview dans un thread daemon.
+        Le rendu PdfRenderer est automatiquement dispatch sur le
+        main thread via _android_pdf_all_pages_uri -> Clock.schedule_once.
         """
         self.status_lbl.text = "Chargement des pages..."
         self.picker.pages = []
@@ -1092,9 +1094,7 @@ class MainScreen(Screen):
     def _on_pdf_selected(self, source):
         """
         Enregistre le chemin du PDF et active le bouton picker.
-        NE PAS appeler pdf_page_count() ici sur Android : cela ouvrirait
-        un PdfRenderer dont le fd serait recycle par le kernel lors du
-        prochain appel (load_pdf_preview) -> Invalid ID: xx.
+        NE PAS appeler pdf_page_count() ici sur Android.
         total_pages sera mis a jour dans load_pdf_preview._done.
         Sur desktop (HAS_FITZ=True), pdf_page_count() est sans risque.
         """
