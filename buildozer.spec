@@ -1,20 +1,20 @@
 [app]
 
-# ── Identite ──────────────────────────────────────────────────────────────
+# ── Identite ───────────────────────────────────────────────────────
 title           = Fake Scan PDF
 package.name    = fakescanpdf
 package.domain  = org.fakescan
 version         = 1.0
 
-# ── Code source ─────────────────────────────────────────────────────────────
+# ── Code source ─────────────────────────────────────────────────────
 source.dir      = .
 source.include_exts = py,png,jpg,jpeg,kv,atlas
 
-# ── Point d'entree ──────────────────────────────────────────────────────────
+# ── Point d'entree ────────────────────────────────────────────────────
 entrypoint      = main.py
 
-# ── Dependances Python ────────────────────────────────────────────────────────
-requirements    = python3,kivy==2.3.0,pillow,plyer
+# ── Dependances Python ───────────────────────────────────────────────────────────
+requirements    = python3,kivy==2.3.0,pillow,plyer,pymupdf
 
 # ── Android ────────────────────────────────────────────────────────────────
 android.permissions = READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,\
@@ -33,7 +33,7 @@ orientation     = portrait
 # Icone (optionnel - remplacer par votre fichier)
 # icon.filename = %(source.dir)s/icon.png
 
-# ── Signature release ──────────────────────────────────────────────────────────
+# ── Signature release ────────────────────────────────────────────────────────────────
 # Le fichier fakescan.keystore doit etre dans le meme dossier que ce spec.
 # Ne jamais commiter fakescan.keystore dans git (voir .gitignore).
 # Remplacer YOUR_PASSWORD par votre mot de passe reel en local.
