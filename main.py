@@ -60,7 +60,6 @@ if ANDROID:
         _BitmapConfig         = autoclass("android.graphics.Bitmap$Config")
         _BitmapCompressFormat = autoclass("android.graphics.Bitmap$CompressFormat")
         _ByteArrayOS          = autoclass("java.io.ByteArrayOutputStream")
-        _DataInputStream      = autoclass("java.io.DataInputStream")
         _Color_java           = autoclass("android.graphics.Color")
         _Canvas_java          = autoclass("android.graphics.Canvas")
         _Intent               = autoclass("android.content.Intent")
@@ -296,53 +295,63 @@ DPI_PREVIEW = 100
 DPI_PROCESS = 250
 
 
-def _android_read_uri_to_bytes(uri_string):
+def _android_uri_to_seekable_file(uri_string, suffix=".pdf"):
     """
-    Lit un URI ContentResolver en bytes Python, sans creer de tableau Java.
+    Copie un URI ContentResolver dans un fichier temp seekable.
 
-    Strategie :
-      1. On enveloppe l'InputStream dans un DataInputStream Java.
-      2. On lit la taille disponible via available(), on alloue un
-         ByteArrayOutputStream et on lit octet par octet avec read()
-         MAIS en blocs logiques geres cote Java grace a DataInputStream.
-      3. En pratique : boucle read()-par-int avec baos.write(b) —
-         aucun byte[] Java n'est jamais instancie cote Python/Jnius.
+    STRATEGIE DEFINITIVE :
+      On ouvre le ParcelFileDescriptor de l'URI en lecture (MODE_READ_ONLY),
+      on recupere le file descriptor POSIX entier via getFd(), puis on lit
+      en Python pur avec os.read() en blocs de 64 Ko.
+      Zero transfert Jnius de bytes, zero tableau Java, zero ByteArrayOS.
 
-    Note : DataInputStream.read() sans argument retourne un int (0-255)
-    exactement comme InputStream.read(), mais DataInputStream peut etre
-    enrichi facilement si besoin. Ici on l'utilise surtout pour la
-    clarte et la robustesse (fermeture correcte via close()).
+      PdfRenderer exige un fichier seekable : on copie dans le CacheDir.
     """
     context  = _PythonActivity.mActivity
     resolver = context.getContentResolver()
     uri      = _Uri.parse(uri_string)
-    raw      = resolver.openInputStream(uri)
-    dis      = _DataInputStream(raw)
-    baos     = _ByteArrayOS()
-    while True:
-        b = dis.read()   # retourne int 0-255 ou -1 (EOF)
-        if b < 0:
-            break
-        baos.write(b)
-    dis.close()
-    return bytes(baos.toByteArray())
 
+    # Ouvre un PFD en lecture sur l'URI
+    pfd_src  = resolver.openFileDescriptor(uri, "r")
+    src_fd   = pfd_src.getFd()          # int : file descriptor POSIX
 
-def _android_uri_to_seekable_file(uri_string, suffix=".pdf"):
-    """
-    Copie le contenu d'un URI dans un fichier temp seekable du CacheDir.
-    Utilise os.write() + os.fsync() pour garantir que tout est sur disque
-    avant que PdfRenderer ouvre le fichier.
-    """
-    data      = _android_read_uri_to_bytes(uri_string)
-    cache_dir = _PythonActivity.mActivity.getCacheDir().getAbsolutePath()
-    fd, tmp_path = tempfile.mkstemp(suffix=suffix, dir=cache_dir)
+    cache_dir = context.getCacheDir().getAbsolutePath()
+    fd_dst, tmp_path = tempfile.mkstemp(suffix=suffix, dir=cache_dir)
     try:
-        os.write(fd, data)
-        os.fsync(fd)
+        while True:
+            chunk = os.read(src_fd, 65536)  # lecture Python pure, 64 Ko
+            if not chunk:
+                break
+            os.write(fd_dst, chunk)
+        os.fsync(fd_dst)
     finally:
-        os.close(fd)
+        os.close(fd_dst)
+        pfd_src.close()
+
     return tmp_path
+
+
+def _android_read_uri_to_bytes(uri_string):
+    """
+    Lit un URI ContentResolver en bytes Python via fd POSIX.
+    Utilise la meme strategie que _android_uri_to_seekable_file
+    mais retourne les bytes directement (pour les images).
+    """
+    context  = _PythonActivity.mActivity
+    resolver = context.getContentResolver()
+    uri      = _Uri.parse(uri_string)
+    pfd_src  = resolver.openFileDescriptor(uri, "r")
+    src_fd   = pfd_src.getFd()
+    chunks   = []
+    try:
+        while True:
+            chunk = os.read(src_fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        pfd_src.close()
+    return b"".join(chunks)
 
 
 def _android_open_renderer_from_path(path):
