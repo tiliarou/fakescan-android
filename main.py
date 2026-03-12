@@ -28,6 +28,9 @@ Note moteur PDF Android :
     5. Bitmap.createBitmap() exige un objet Bitmap$Config Java, PAS un
        entier brut -> utiliser _BitmapConfig.ARGB_8888.
     6. page.close() doit etre appele APRES page.render(), jamais avant.
+    7. bitmap.eraseColor() exige un int Python brut (ARGB 32 bits).
+       Color.WHITE via jnius est un objet Java boxe -> IllegalArgumentException.
+       Utiliser directement 0xFFFFFFFF.
 """
 
 import io
@@ -92,6 +95,11 @@ else:
 # -- jnius / PdfRenderer : Android uniquement ------------------------------
 PDF_RENDER_MODE_FOR_DISPLAY = 1
 
+# Couleur blanche en ARGB 32 bits : entier Python pur.
+# Color.WHITE via jnius retourne un objet Java boxe incompatible avec
+# bitmap.eraseColor() qui attend un int primitif -> IllegalArgumentException.
+COLOR_WHITE_ARGB = 0xFFFFFFFF
+
 if ANDROID:
     try:
         from jnius import autoclass
@@ -105,7 +113,6 @@ if ANDROID:
         _BitmapConfig         = autoclass("android.graphics.Bitmap$Config")
         _BitmapCompressFormat = autoclass("android.graphics.Bitmap$CompressFormat")
         _ByteArrayOS          = autoclass("java.io.ByteArrayOutputStream")
-        _Color_java           = autoclass("android.graphics.Color")
         _Intent               = autoclass("android.content.Intent")
         _ContentValues        = autoclass("android.content.ContentValues")
         _Downloads            = autoclass("android.provider.MediaStore$Downloads")
@@ -116,6 +123,7 @@ if ANDROID:
         _Matrix               = autoclass("android.graphics.Matrix")
 
         _log("INIT: BitmapConfig.ARGB_8888={}".format(_BitmapConfig.ARGB_8888))
+        _log("INIT: COLOR_WHITE_ARGB=0x{:08X}".format(COLOR_WHITE_ARGB))
 
     except ImportError:
         HAS_JNIUS = False
@@ -393,10 +401,11 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
     Rend toutes les pages d'un PDF Android en liste PIL.Image.
 
     FIX 1 : cast(type, None) -> SIGSEGV. Utilise _Rect et _Matrix reels.
-    FIX 2 : Bitmap.createBitmap(w, h, int) inexistant en JNI.
-            Il faut passer _BitmapConfig.ARGB_8888 (objet Java enum).
-    FIX 3 : page.close() doit etre dans le finally APRES render,
-            pas avant createBitmap.
+    FIX 2 : Bitmap.createBitmap(w, h, int) inexistant -> passer _BitmapConfig.ARGB_8888.
+    FIX 3 : page.close() dans le finally local APRES page.render().
+    FIX 4 : bitmap.eraseColor(Color.WHITE) -> IllegalArgumentException.
+            Color.WHITE via jnius est un objet Java boxe, pas un int primitif.
+            Utiliser 0xFFFFFFFF (entier Python = int32 ARGB blanc).
     """
     _log("_android_pdf_all_pages_uri: uri={} dpi={}".format(uri_string[:60], dpi))
 
@@ -431,20 +440,18 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
                     h = max(1, int(page.getHeight() * scale))
                     _log("RENDER: page dims={}x{} (dpi={}, scale={:.2f})".format(w, h, dpi, scale))
 
-                    # Vrais objets Java (pas de cast None -> SIGSEGV)
                     dest_rect = _Rect(0, 0, w, h)
                     identity  = _Matrix()
                     _log("RENDER: dest_rect={}x{} identity=Matrix()".format(w, h))
 
-                    # FIX : passer _BitmapConfig.ARGB_8888 (objet Java)
-                    # et non l'entier 4 -> JavaException no matching overload
                     config = _BitmapConfig.ARGB_8888
                     _log("RENDER: calling Bitmap.createBitmap({}, {}, ARGB_8888)".format(w, h))
                     bitmap = _Bitmap.createBitmap(w, h, config)
                     _log("RENDER: createBitmap OK")
 
-                    _log("RENDER: calling eraseColor(WHITE)")
-                    bitmap.eraseColor(_Color_java.WHITE)
+                    # FIX 4 : entier Python brut, PAS Color.WHITE (objet Java)
+                    _log("RENDER: calling eraseColor(0xFFFFFFFF)")
+                    bitmap.eraseColor(COLOR_WHITE_ARGB)
                     _log("RENDER: eraseColor OK")
 
                     _log("RENDER: calling page.render(bitmap, dest_rect, identity, {})".format(
@@ -457,7 +464,6 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
                     _log("RENDER: page {} DONE".format(i + 1))
 
                 finally:
-                    # FIX : page.close() APRES render, pas avant
                     if page is not None:
                         try:
                             page.close()
