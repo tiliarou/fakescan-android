@@ -51,7 +51,6 @@ if ANDROID:
         from jnius import autoclass
         HAS_JNIUS = True
 
-        # -- Toutes les classes Java chargees UNE SEULE FOIS au demarrage --
         _PythonActivity       = autoclass("org.kivy.android.PythonActivity")
         _Uri                  = autoclass("android.net.Uri")
         _ParcelFileDescriptor = autoclass("android.os.ParcelFileDescriptor")
@@ -61,6 +60,7 @@ if ANDROID:
         _BitmapConfig         = autoclass("android.graphics.Bitmap$Config")
         _BitmapCompressFormat = autoclass("android.graphics.Bitmap$CompressFormat")
         _ByteArrayOS          = autoclass("java.io.ByteArrayOutputStream")
+        _DataInputStream      = autoclass("java.io.DataInputStream")
         _Color_java           = autoclass("android.graphics.Color")
         _Canvas_java          = autoclass("android.graphics.Canvas")
         _Intent               = autoclass("android.content.Intent")
@@ -298,39 +298,41 @@ DPI_PROCESS = 250
 
 def _android_read_uri_to_bytes(uri_string):
     """
-    Lit TOUT le contenu d'un URI ContentResolver en bytes Python.
+    Lit un URI ContentResolver en bytes Python, sans creer de tableau Java.
 
-    Strategie : on appelle istream.read() SANS argument, ce qui retourne
-    un int (0-255) par appel, ou -1 en fin de stream. Cela ne necessite
-    AUCUN tableau Java et evite l'erreur "No constructor available" de Jnius
-    lors de la creation de byte[] via autoclass("[B").
+    Strategie :
+      1. On enveloppe l'InputStream dans un DataInputStream Java.
+      2. On lit la taille disponible via available(), on alloue un
+         ByteArrayOutputStream et on lit octet par octet avec read()
+         MAIS en blocs logiques geres cote Java grace a DataInputStream.
+      3. En pratique : boucle read()-par-int avec baos.write(b) —
+         aucun byte[] Java n'est jamais instancie cote Python/Jnius.
 
-    La copie est faite via transferTo() de Java 9+ si disponible,
-    sinon via la boucle read()-par-octet dans un ByteArrayOutputStream.
+    Note : DataInputStream.read() sans argument retourne un int (0-255)
+    exactement comme InputStream.read(), mais DataInputStream peut etre
+    enrichi facilement si besoin. Ici on l'utilise surtout pour la
+    clarte et la robustesse (fermeture correcte via close()).
     """
     context  = _PythonActivity.mActivity
     resolver = context.getContentResolver()
     uri      = _Uri.parse(uri_string)
-    istream  = resolver.openInputStream(uri)
+    raw      = resolver.openInputStream(uri)
+    dis      = _DataInputStream(raw)
     baos     = _ByteArrayOS()
-    # transferTo() existe depuis Java 9 / API 33 (Android 13).
-    # Sur les appareils plus anciens on tombe dans le except.
-    try:
-        istream.transferTo(baos)
-    except Exception:
-        # Fallback : lecture octet par octet (lent mais universel)
-        while True:
-            b = istream.read()   # retourne int 0-255 ou -1
-            if b < 0:
-                break
-            baos.write(b)
-    istream.close()
+    while True:
+        b = dis.read()   # retourne int 0-255 ou -1 (EOF)
+        if b < 0:
+            break
+        baos.write(b)
+    dis.close()
     return bytes(baos.toByteArray())
 
 
 def _android_uri_to_seekable_file(uri_string, suffix=".pdf"):
     """
-    Copie le contenu d'un URI dans un fichier temp du CacheDir (seekable).
+    Copie le contenu d'un URI dans un fichier temp seekable du CacheDir.
+    Utilise os.write() + os.fsync() pour garantir que tout est sur disque
+    avant que PdfRenderer ouvre le fichier.
     """
     data      = _android_read_uri_to_bytes(uri_string)
     cache_dir = _PythonActivity.mActivity.getCacheDir().getAbsolutePath()
@@ -344,7 +346,7 @@ def _android_uri_to_seekable_file(uri_string, suffix=".pdf"):
 
 
 def _android_open_renderer_from_path(path):
-    """Ouvre un PdfRenderer depuis un chemin fichier local. Retourne (renderer, pfd)."""
+    """Ouvre un PdfRenderer depuis un chemin fichier local."""
     pfd      = _ParcelFileDescriptor.open(
         _File(path), _ParcelFileDescriptor.MODE_READ_ONLY
     )
@@ -353,7 +355,7 @@ def _android_open_renderer_from_path(path):
 
 
 def _android_render_page(renderer, page_index, dpi):
-    """Rend une page depuis un PdfRenderer DEJA OUVERT. Retourne une PIL Image RGB."""
+    """Rend une page PDF en PIL Image RGB."""
     page   = renderer.openPage(page_index)
     scale  = dpi / 72.0
     width  = int(page.getWidth()  * scale)
@@ -372,10 +374,6 @@ def _android_render_page(renderer, page_index, dpi):
 
 
 def _android_pdf_all_pages_uri(uri_string, dpi):
-    """
-    Rend toutes les pages : copie dans CacheDir, ouvre le renderer une seule fois.
-    Supprime le fichier temp a la fin.
-    """
     tmp_path = _android_uri_to_seekable_file(uri_string, suffix=".pdf")
     renderer, pfd = _android_open_renderer_from_path(tmp_path)
     images = []
@@ -467,7 +465,7 @@ def pil_to_kivy_texture(pil_img):
 
 
 # -------------------------------------------------------------------------
-# IMAGE HELPER : ouvrir une image depuis URI ou chemin
+# IMAGE HELPER
 # -------------------------------------------------------------------------
 
 def open_image_from_source(source):
