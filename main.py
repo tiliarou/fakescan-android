@@ -19,6 +19,7 @@ import random
 import threading
 import sys
 import tempfile
+import traceback as _traceback
 
 # -- Kivy config (avant tout import kivy) ----------------------------------
 from kivy.config import Config
@@ -45,6 +46,25 @@ from PIL import Image, ImageFilter, ImageEnhance, ImageOps, ImageChops
 
 # -- Detection Android -----------------------------------------------------
 ANDROID = sys.platform == "linux" and "ANDROID_ARGUMENT" in os.environ
+
+# -- Logger Android (tag Python dans logcat) --------------------------------
+def _android_log(msg, tag="FakeScanPDF"):
+    """
+    Ecrit dans logcat via android.util.Log.d().
+    Utilise print() comme fallback si jnius pas encore init.
+    """
+    try:
+        from jnius import autoclass
+        Log = autoclass("android.util.Log")
+        Log.d(tag, str(msg))
+    except Exception:
+        print("[{}] {}".format(tag, msg))
+
+def _log(msg):
+    if ANDROID:
+        _android_log(msg)
+    else:
+        print("[FakeScanPDF]", msg)
 
 if ANDROID:
     try:
@@ -317,6 +337,7 @@ def _android_uri_to_seekable_file(uri_string, suffix=".pdf"):
     finally:
         os.close(fd_dst)
         pfd_src.close()
+    _log("_android_uri_to_seekable_file: tmp={}".format(tmp_path))
     return tmp_path
 
 
@@ -351,6 +372,7 @@ def _android_render_page_from_path(path, page_index, dpi):
     On ne doit donc JAMAIS appeler pfd.close() apres renderer.close()
     sous peine de fermer un fd deja recycle par le kernel (bug fd 63).
     """
+    _log("_android_render_page_from_path: path={} page={} dpi={}".format(path, page_index, dpi))
     pfd      = _ParcelFileDescriptor.open(
         _File(path), _ParcelFileDescriptor.MODE_READ_ONLY
     )
@@ -377,63 +399,84 @@ def _android_render_page_from_path(path, page_index, dpi):
 def _android_pdf_all_pages_uri(uri_string, dpi):
     """Rend toutes les pages d'un URI dans une seule instance de PdfRenderer.
 
-    Cette version ouvre une seule fois le fichier et itere sur les pages,
-    ce qui est plus robuste que d'ouvrir/fermer un PdfRenderer par page
-    (certaines implémentations de PdfRenderer n'aiment pas les ouvertures
-    répétées en rafale et finissent par lever des erreurs du type
-    "Invalid ID: xx").
+    - Un seul PdfRenderer pour tout le fichier (evite Invalid ID: xx).
+    - Le fichier temporaire est supprime APRES renderer.close().
     """
+    _log("_android_pdf_all_pages_uri: uri={} dpi={}".format(uri_string[:60], dpi))
     tmp_path = _android_uri_to_seekable_file(uri_string, suffix=".pdf")
+    renderer = None
+    pfd      = None
     try:
         pfd      = _ParcelFileDescriptor.open(
             _File(tmp_path), _ParcelFileDescriptor.MODE_READ_ONLY
         )
         renderer = _PdfRenderer(pfd)
-        # renderer prend ownership de pfd
-        try:
-            count  = renderer.getPageCount()
-            images = []
-            for i in range(count):
-                page = renderer.openPage(i)
-                try:
-                    scale  = dpi / 72.0
-                    width  = int(page.getWidth()  * scale)
-                    height = int(page.getHeight() * scale)
-                    bitmap = _Bitmap.createBitmap(width, height, _BitmapConfig.ARGB_8888)
-                    canvas = _Canvas_java(bitmap)
-                    canvas.drawColor(_Color_java.WHITE)
-                    page.render(bitmap, None, None, _PdfRendererPage.RENDER_MODE_FOR_PRINT)
-                finally:
-                    page.close()
-                baos = _ByteArrayOS()
-                bitmap.compress(_BitmapCompressFormat.PNG, 100, baos)
-                img = Image.open(io.BytesIO(bytes(baos.toByteArray())))
-                images.append(ensure_white_bg(img))
-            return images
-        finally:
-            renderer.close()  # ferme aussi pfd
+        # renderer prend ownership de pfd — ne pas fermer pfd separement
+        count = renderer.getPageCount()
+        _log("_android_pdf_all_pages_uri: pageCount={}".format(count))
+        images = []
+        for i in range(count):
+            _log("_android_pdf_all_pages_uri: rendering page {}/{}".format(i + 1, count))
+            page = renderer.openPage(i)
+            try:
+                scale  = dpi / 72.0
+                width  = int(page.getWidth()  * scale)
+                height = int(page.getHeight() * scale)
+                bitmap = _Bitmap.createBitmap(width, height, _BitmapConfig.ARGB_8888)
+                canvas = _Canvas_java(bitmap)
+                canvas.drawColor(_Color_java.WHITE)
+                page.render(bitmap, None, None, _PdfRendererPage.RENDER_MODE_FOR_PRINT)
+            finally:
+                page.close()
+            baos = _ByteArrayOS()
+            bitmap.compress(_BitmapCompressFormat.PNG, 100, baos)
+            img = Image.open(io.BytesIO(bytes(baos.toByteArray())))
+            images.append(ensure_white_bg(img))
+        _log("_android_pdf_all_pages_uri: done, {} images".format(len(images)))
+        return images
+    except Exception as exc:
+        _log("_android_pdf_all_pages_uri ERROR: " + _traceback.format_exc())
+        raise
     finally:
+        # Fermer le renderer AVANT de supprimer le fichier
+        if renderer is not None:
+            try:
+                renderer.close()  # ferme aussi pfd
+            except Exception as e:
+                _log("renderer.close() error: {}".format(e))
+        # Maintenant on peut supprimer le fichier temp en securite
         try:
             os.unlink(tmp_path)
-        except Exception:
-            pass
+            _log("_android_pdf_all_pages_uri: tmp deleted")
+        except Exception as e:
+            _log("unlink tmp error: {}".format(e))
 
 
 def _android_pdf_page_count_uri(uri_string):
+    _log("_android_pdf_page_count_uri: uri={}".format(uri_string[:60]))
     tmp_path = _android_uri_to_seekable_file(uri_string, suffix=".pdf")
+    renderer = None
     try:
         pfd      = _ParcelFileDescriptor.open(
             _File(tmp_path), _ParcelFileDescriptor.MODE_READ_ONLY
         )
         renderer = _PdfRenderer(pfd)
         count    = renderer.getPageCount()
-        renderer.close()  # ferme pfd en interne
+        _log("_android_pdf_page_count_uri: count={}".format(count))
         return count
+    except Exception as exc:
+        _log("_android_pdf_page_count_uri ERROR: " + _traceback.format_exc())
+        raise
     finally:
+        if renderer is not None:
+            try:
+                renderer.close()  # ferme pfd en interne
+            except Exception as e:
+                _log("renderer.close() error: {}".format(e))
         try:
             os.unlink(tmp_path)
-        except Exception:
-            pass
+        except Exception as e:
+            _log("unlink tmp error: {}".format(e))
 
 
 def pdf_page_count(pdf_source):
@@ -750,8 +793,10 @@ class PickerScreen(Screen):
         self.picker.canvas.clear()
 
         def _load():
+            _log("load_pdf_preview: start source={}".format(str(pdf_source)[:60]))
             try:
                 pages = pdf_preview_all_pages(pdf_source, dpi=DPI_PREVIEW)
+                _log("load_pdf_preview: got {} pages".format(len(pages)))
                 def _done(dt):
                     self.picker.set_pages(pages)
                     app = App.get_running_app()
@@ -761,8 +806,8 @@ class PickerScreen(Screen):
                         n, "s" if n > 1 else "")
                 Clock.schedule_once(_done)
             except Exception as exc:
-                import traceback
-                err = traceback.format_exc()
+                err = _traceback.format_exc()
+                _log("load_pdf_preview ERROR: " + err)
                 Clock.schedule_once(
                     lambda dt, e=err: setattr(self.status_lbl, "text", "Erreur : " + e))
 
@@ -819,8 +864,7 @@ if ANDROID:
                 Clock.schedule_once(lambda dt: cb(uri_string))
 
             except Exception:
-                import traceback
-                traceback.print_exc()
+                _traceback.print_exc()
 
     activity_bind(on_activity_result=_on_activity_result)
 
@@ -1195,7 +1239,7 @@ class MainScreen(Screen):
                     Clock.schedule_once(
                         lambda dt, n=out_filename, u=content_uri_str: self._on_done(n, u))
                 except Exception:
-                    import traceback; traceback.print_exc()
+                    _traceback.print_exc()
                     out_dir  = _Environment.getExternalStoragePublicDirectory(
                         _Environment.DIRECTORY_DOWNLOADS).getAbsolutePath()
                     out_path = os.path.join(out_dir, out_filename)
@@ -1210,8 +1254,8 @@ class MainScreen(Screen):
                     lambda dt, n=out_filename, u=None: self._on_done(n, u))
 
         except Exception as exc:
-            import traceback
-            err = traceback.format_exc()
+            err = _traceback.format_exc()
+            _log("_worker ERROR: " + err)
             Clock.schedule_once(lambda dt, e=err: self._on_error(e))
 
     def _on_done(self, out_filename, content_uri_str=None):
