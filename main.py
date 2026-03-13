@@ -28,9 +28,11 @@ Note moteur PDF Android :
     5. Bitmap.createBitmap() exige un objet Bitmap$Config Java, PAS un
        entier brut -> utiliser _BitmapConfig.ARGB_8888.
     6. page.close() doit etre appele APRES page.render(), jamais avant.
-    7. bitmap.eraseColor() exige un int Python brut (ARGB 32 bits).
-       Color.WHITE via jnius est un objet Java boxe -> IllegalArgumentException.
-       Utiliser directement 0xFFFFFFFF.
+    7. NE PAS appeler bitmap.eraseColor() via jnius : meme avec un int
+       Python brut (0xFFFFFFFF), certains firmwares levent
+       IllegalArgumentException "Invalid ID 63".
+       Le fond blanc est garanti cote PIL par ensure_white_bg() apres
+       _bitmap_to_pil().
 """
 
 import io
@@ -95,11 +97,6 @@ else:
 # -- jnius / PdfRenderer : Android uniquement ------------------------------
 PDF_RENDER_MODE_FOR_DISPLAY = 1
 
-# Couleur blanche en ARGB 32 bits : entier Python pur.
-# Color.WHITE via jnius retourne un objet Java boxe incompatible avec
-# bitmap.eraseColor() qui attend un int primitif -> IllegalArgumentException.
-COLOR_WHITE_ARGB = 0xFFFFFFFF
-
 if ANDROID:
     try:
         from jnius import autoclass
@@ -123,7 +120,6 @@ if ANDROID:
         _Matrix               = autoclass("android.graphics.Matrix")
 
         _log("INIT: BitmapConfig.ARGB_8888={}".format(_BitmapConfig.ARGB_8888))
-        _log("INIT: COLOR_WHITE_ARGB=0x{:08X}".format(COLOR_WHITE_ARGB))
 
     except ImportError:
         HAS_JNIUS = False
@@ -136,6 +132,9 @@ else:
 # -------------------------------------------------------------------------
 
 def ensure_white_bg(img):
+    """Garantit un fond blanc : applique en PIL APRES _bitmap_to_pil().
+    Ne pas utiliser bitmap.eraseColor() via jnius (crash firmware).
+    """
     if img.mode in ("RGBA", "LA"):
         bg = Image.new("RGB", img.size, (255, 255, 255))
         bg.paste(img, mask=img.split()[-1])
@@ -403,9 +402,10 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
     FIX 1 : cast(type, None) -> SIGSEGV. Utilise _Rect et _Matrix reels.
     FIX 2 : Bitmap.createBitmap(w, h, int) inexistant -> passer _BitmapConfig.ARGB_8888.
     FIX 3 : page.close() dans le finally local APRES page.render().
-    FIX 4 : bitmap.eraseColor(Color.WHITE) -> IllegalArgumentException.
-            Color.WHITE via jnius est un objet Java boxe, pas un int primitif.
-            Utiliser 0xFFFFFFFF (entier Python = int32 ARGB blanc).
+    FIX 4 : NE PAS appeler bitmap.eraseColor() via jnius, meme avec un int
+            Python brut -> IllegalArgumentException "Invalid ID 63" sur
+            certains firmwares. Le fond blanc est gere par ensure_white_bg()
+            en PIL apres _bitmap_to_pil().
     """
     _log("_android_pdf_all_pages_uri: uri={} dpi={}".format(uri_string[:60], dpi))
 
@@ -449,10 +449,9 @@ def _android_pdf_all_pages_uri(uri_string, dpi):
                     bitmap = _Bitmap.createBitmap(w, h, config)
                     _log("RENDER: createBitmap OK")
 
-                    # FIX 4 : entier Python brut, PAS Color.WHITE (objet Java)
-                    _log("RENDER: calling eraseColor(0xFFFFFFFF)")
-                    bitmap.eraseColor(COLOR_WHITE_ARGB)
-                    _log("RENDER: eraseColor OK")
+                    # Pas d'eraseColor : crash jnius sur ce firmware
+                    # (IllegalArgumentException Invalid ID 63 meme avec int brut).
+                    # Le fond blanc est garanti par ensure_white_bg() cote PIL.
 
                     _log("RENDER: calling page.render(bitmap, dest_rect, identity, {})".format(
                         PDF_RENDER_MODE_FOR_DISPLAY))
